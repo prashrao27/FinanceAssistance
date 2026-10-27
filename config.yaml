@@ -1,0 +1,31 @@
+app:
+  name: Finance Assistant
+
+llm:
+  model: gpt-4o-mini
+
+mcp:
+  server_url: http://127.0.0.1:8000/mcp
+
+logging:
+  level: INFO
+
+data:
+  directory: src/data
+
+qdrant:
+  collection: FinAi
+
+rag:
+  dense_embedding_model: BAAI/bge-large-en-v1.5
+  sparse_embedding_model: prithvida/Splade_PP_en_v1
+
+search:
+  cache_ttl_seconds: 60
+  cache_max_entries: 256
+  max_results: 50
+
+finance_api:
+  request_timeout_seconds: 15
+  max_attempts: 3
+  max_retry_delay_seconds: 8
