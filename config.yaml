@@ -4,6 +4,10 @@ app:
 llm:
   model: gpt-4o-mini
 
+router:
+  model: "~typesafe/jev-latest"
+  base_url: https://openrouter.ai
+
 mcp:
   server_url: http://127.0.0.1:8000/mcp
 

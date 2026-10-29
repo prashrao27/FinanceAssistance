@@ -50,7 +50,7 @@ flowchart LR
     ConversationStore -->|explicit learning profile| Workflow
     User -->|profile edits and history commands| CLI[Interactive CLI]
     CLI --> ConversationStore
-    Workflow --> Router[LangChain intent router]
+    Workflow --> Router[OpenRouter JEV intent model]
     Router --> Specialist[Selected finance specialist]
     Workflow --> MCP[MCP Streamable HTTP server]
     Specialist --> MCP
@@ -64,7 +64,7 @@ flowchart LR
     Ingestion --> Embedding
     Ingestion --> Qdrant
     Workflow -. "optional run traces" .-> LangSmith[LangSmith tracing]
-    EvalSet[Curated evaluation dataset] -. "offline evaluation (planned)" .-> LangSmith
+    EvalSet[Curated evaluation dataset] -. "A/B experiments and evaluators" .-> LangSmith
 ```
 
 ### Main runtime flow
@@ -74,9 +74,11 @@ flowchart LR
 2. Before invoking the graph, the workflow loads the user's explicit profile
    and the configured number of latest turns for that thread from SQLite.
    The full transcript remains stored.
-3. The router receives the current question and recent conversation turns,
-   then selects one specialist. The user's profile is supplied to the selected
-   specialist as context for adapting explanations and goals-based guidance.
+3. The dedicated Jev intent model receives the current question and recent
+   conversation turns through OpenRouter's Decisions API. The workflow selects
+   the highest-scoring specialist. The user's profile is supplied to the
+   selected specialist as context for adapting explanations and goals-based
+   guidance.
 4. The workflow retrieves relevant Qdrant chunks using the current question
    and recent conversation context, filtered by the selected specialist's
    document type.
@@ -131,11 +133,46 @@ retrieved content, model output, and tool inputs/outputs. Do not send
 personally identifiable information or financial account data to LangSmith
 unless the project's privacy, consent, and retention policies permit it.
 
-**Implementation status:** Optional tracing is wired into the workflow.
-LangSmith credentials must be configured locally to send traces. Evaluation
-datasets and evaluators are not configured in this repository. Traces may
-include the current conversation history and saved profile context; avoid
-entering sensitive personal or financial information when tracing is enabled.
+The evaluation harness creates or reuses the versioned
+`finance-assistant-routing-v1` LangSmith dataset from
+`src/evaluation/datasets/finance_router_v1.json`. It has twelve synthetic
+queries covering all six specialists. Three evaluators record exact route
+accuracy, non-empty answers, and rubric-based answer quality from the configured
+OpenAI model. Experiment A uses the Jev Decisions API router; experiment B uses
+an OpenAI structured-output router. Both use the same specialist answer model,
+retrieval, MCP tools, dataset, and evaluators.
+
+The initial 12-example run on 2026-10-29 completed both experiments. Both
+variants achieved 100% route accuracy and 100% non-empty answers. The normalized
+LLM-judge answer-quality scores were 0.850 for Jev and 0.883 for OpenAI. This
+small synthetic dataset is a smoke-test baseline, not sufficient evidence that
+one router is generally better; rerun after changes and expand the dataset for
+release decisions.
+
+- [Experiment A: Jev Decisions API](https://smith.langchain.com/o/3e206f05-13ed-4e56-bfc2-974149837580/projects/p/8eb1c334-c3b9-4bfd-bf23-af0943d8b982)
+- [Experiment B: OpenAI structured router](https://smith.langchain.com/o/3e206f05-13ed-4e56-bfc2-974149837580/projects/p/38f47de2-d292-49f2-abbc-e9099f018f61)
+- [Compare the two experiments](https://smith.langchain.com/o/3e206f05-13ed-4e56-bfc2-974149837580/datasets/6d6145db-993c-4304-b89a-1699a0d78e9c/compare?selectedSessions=8eb1c334-c3b9-4bfd-bf23-af0943d8b982%2C38f47de2-d292-49f2-abbc-e9099f018f61)
+
+Run both experiments from the project root after starting the MCP server and
+setting `LANGSMITH_API_KEY`, `OPENAI_API_KEY`, and `OPENROUTER_API_KEY` in the
+local `.env`:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m evaluation.langsmith_experiments
+```
+
+To create or reuse the LangSmith dataset without running model calls:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m evaluation.langsmith_experiments --dataset-only
+```
+
+The script prints experiment URLs and a comparison URL. It runs one example at a
+time to limit concurrent calls to external model and MCP services. Use only
+synthetic evaluation queries; LangSmith traces can retain prompts, retrieved
+content, tool inputs/outputs, and model answers. This baseline comparison
+measures routing impact while keeping answer generation and supporting services
+constant; market/news examples can still depend on external data availability.
 
 ### Deployment boundaries
 
@@ -162,7 +199,7 @@ entering sensitive personal or financial information when tracing is enabled.
 | `core/errors.py` | Defines the shared application exception base. |
 | `agents/router.py` | Defines the structured route decision and routing instructions. |
 | `agents/specialists.py` | Defines the six specialist identities, prompts, knowledge filters, and allowed MCP tool names. |
-| `workflow/assistant.py` | Loads recent history and user profile for routing and response context, runs route → retrieval → specialist execution, persists successful turns, and exposes the interactive CLI. |
+| `workflow/assistant.py` | Loads recent history and user profile, routes intent with the configured OpenRouter model, runs retrieval and specialist execution with the answer model, persists successful turns, and exposes the interactive CLI. |
 | `mcp_server/server.py` | Registers MCP tools and serves them using Streamable HTTP. |
 | `data/finance_api.py` | Validates finance API inputs, calls Alpha Vantage with retries, caching, and TLS verification; implements portfolio summary. |
 | `data/knowledge_service.py` | Embeds query text, performs dense and sparse Qdrant prefetch, fuses ranks with RRF, and caches search results. |
@@ -285,6 +322,10 @@ environment variables or the local, ignored `.env` file; they must not be
 stored in `config.yaml` or committed. Important settings include:
 
 - Model and MCP endpoint: `OPENAI_MODEL`, `MCP_SERVER_URL`.
+- Specialist response model: `OPENAI_API_KEY`, `OPENAI_MODEL`.
+- Specialist intent router: `OPENROUTER_API_KEY`; the model and API base URL
+  are set under `router` in `config.yaml` and can be overridden with
+  `OPENROUTER_MODEL` and `OPENROUTER_BASE_URL`.
 - Credentials: `OPENAI_API_KEY`, `ALPHA_VANTAGE_API_KEY`.
 - Optional tracing: enable `langsmith.tracing` in `config.yaml`, or override
   it with `LANGSMITH_TRACING`; provide `LANGSMITH_API_KEY` in `.env`.
@@ -326,8 +367,11 @@ Add credentials and service URLs to `.env`:
 
 - `ALPHA_VANTAGE_API_KEY` for market-data tools.
 - `QDRANT_URL` and `QDRANT_API_KEY` for knowledge search and ingestion.
-- `OPENAI_API_KEY` for the LangChain router and specialist agents. `OPENAI_MODEL`
-  selects the chat model.
+- `OPENAI_API_KEY` for specialist responses. `OPENAI_MODEL`
+  selects the specialist response model.
+- `OPENROUTER_API_KEY` for the dedicated intent router. The default router
+  model is `~typesafe/jev-latest`; configure `router.model` in `config.yaml` or
+  `OPENROUTER_MODEL` if your OpenRouter account uses a different model ID.
 - Optional LangSmith tracing: set `langsmith.tracing: true` in `config.yaml`
   and provide your `LANGSMITH_API_KEY` in `.env`. The config sets project and
   endpoint defaults; environment variables can override them. Tracing is
@@ -361,10 +405,11 @@ the default local conversation, or use distinct IDs for separate users and
 threads. It then accepts questions until `/quit`. Use `/profile`, `/profile set`,
 `/profile delete`, `/history`, and `/clear-history` to manage saved data.
 The workflow connects to `MCP_SERVER_URL`, retrieves relevant knowledge, and
-uses recent conversation history and the explicit profile as context. Market,
+uses recent conversation history for intent routing and specialist context,
+and uses the explicit profile for specialist personalization. Market,
 portfolio, and news specialists may call only their assigned MCP tools. It
-requires `OPENAI_API_KEY`; data-dependent MCP tools also require their
-API/Qdrant configuration.
+requires `OPENAI_API_KEY` and `OPENROUTER_API_KEY`; data-dependent MCP tools
+also require their API/Qdrant configuration.
 
 ### Manually test persistent conversation history
 

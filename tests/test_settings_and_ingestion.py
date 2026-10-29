@@ -41,6 +41,9 @@ class SettingsAndIngestionTests(unittest.TestCase):
                     "LANGSMITH_ENDPOINT": "https://example.test",
                     "CONVERSATION_DB_PATH": "tmp/test.sqlite3",
                     "CONVERSATION_HISTORY_TURNS": "5",
+                    "OPENROUTER_API_KEY": "test-openrouter-key",
+                    "OPENROUTER_MODEL": "test/provider-model",
+                    "OPENROUTER_BASE_URL": "https://openrouter.example/api/v1",
                 },
             ):
                 settings = get_settings()
@@ -55,6 +58,12 @@ class SettingsAndIngestionTests(unittest.TestCase):
                 PROJECT_ROOT / "tmp/test.sqlite3",
             )
             self.assertEqual(settings.conversation_history_turns, 5)
+            self.assertEqual(settings.openrouter_api_key, "test-openrouter-key")
+            self.assertEqual(settings.router_model, "test/provider-model")
+            self.assertEqual(
+                settings.openrouter_base_url,
+                "https://openrouter.example/api/v1",
+            )
         finally:
             get_settings.cache_clear()
 

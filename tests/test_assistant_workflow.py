@@ -4,10 +4,12 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
-from langchain_core.messages import AIMessage
+import httpx
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import StructuredTool
 
 from agents.router import RouteDecision
@@ -31,7 +33,11 @@ class FakeModel:
         self.router: FakeRouter | None = None
         self.invocations: list[list[Any]] = []
 
-    def with_structured_output(self, schema: type[RouteDecision]) -> FakeRouter:
+    def with_structured_output(
+        self,
+        schema: type[RouteDecision],
+        **kwargs: Any,
+    ) -> FakeRouter:
         self.router = FakeRouter(self.agent)
         return self.router
 
@@ -84,9 +90,11 @@ class AssistantWorkflowTests(unittest.TestCase):
 
     def test_rag_then_routed_specialist(self) -> None:
         async def run() -> dict[str, Any]:
-            model = FakeModel(AgentType.TAX_EDUCATION)
+            model = FakeModel(AgentType.FINANCE_QA)
+            intent_model = FakeModel(AgentType.TAX_EDUCATION)
             graph = await assistant.build_assistant_graph(
                 model=model,
+                router_model=intent_model,
                 mcp_tools=self.tools,
             )
             result = await graph.ainvoke(
@@ -108,18 +116,21 @@ class AssistantWorkflowTests(unittest.TestCase):
                     },
                 }
             )
-            return result, model
+            return result, model, intent_model
 
         with patch.object(
             assistant,
             "create_agent",
             return_value=FakeAgent(),
         ) as create_agent:
-            result, model = asyncio.run(run())
+            result, model, intent_model = asyncio.run(run())
 
         self.assertEqual(result["route"], AgentType.TAX_EDUCATION.value)
         self.assertEqual(result["answer"], "Grounded finance education answer.")
-        self.assertIn("What is a Roth account?", model.router.messages[1].content)
+        self.assertIn(
+            "What is a Roth account?",
+            intent_model.router.messages[1].content,
+        )
         specialist_messages = model.invocations[-1]
         self.assertEqual(specialist_messages[1].content, "What is a Roth account?")
         self.assertEqual(
@@ -152,6 +163,90 @@ class AssistantWorkflowTests(unittest.TestCase):
                 }
             ),
         )
+
+    def test_builds_intent_router_with_openrouter_settings(self) -> None:
+        settings = SimpleNamespace(
+            router_model="~typesafe/jev-latest",
+            openrouter_api_key="test-openrouter-key",
+            openrouter_base_url="https://openrouter.ai/api/v1",
+        )
+        router = assistant._build_intent_router_model(settings)
+        self.assertIsInstance(router, assistant._JevIntentRouter)
+        self.assertEqual(router.model, "~typesafe/jev-latest")
+        self.assertEqual(
+            router.endpoint,
+            "https://openrouter.ai/api/alpha/decisions",
+        )
+
+    def test_jev_intent_router_posts_decisions_and_selects_highest_score(self) -> None:
+        response = httpx.Response(
+            200,
+            json={
+                "answers": {
+                    specialist.name.value: {
+                        "type": "noul",
+                        "noul": (
+                            0.91
+                            if specialist.name is AgentType.PORTFOLIO_ANALYSIS
+                            else 0.1
+                        ),
+                    }
+                    for specialist in SPECIALISTS.values()
+                }
+            },
+        )
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.post.return_value = response
+
+        async def run() -> RouteDecision:
+            router = assistant._JevIntentRouter(
+                model="~typesafe/jev-latest",
+                api_key="test-openrouter-key",
+                base_url="https://openrouter.ai",
+            )
+            with patch.object(
+                assistant.httpx,
+                "AsyncClient",
+                return_value=client,
+            ) as client_factory:
+                decision = await router.ainvoke(
+                    [
+                        SystemMessage(content="Route the question."),
+                        HumanMessage(content="Analyze my holdings."),
+                    ]
+                )
+            client_factory.assert_called_once_with(timeout=30.0)
+            return decision
+
+        decision = asyncio.run(run())
+        request = client.post.await_args
+        self.assertEqual(decision.agent, AgentType.PORTFOLIO_ANALYSIS.value)
+        self.assertEqual(
+            request.args[0],
+            "https://openrouter.ai/api/alpha/decisions",
+        )
+        self.assertEqual(
+            request.kwargs["json"]["model"],
+            "~typesafe/jev-latest",
+        )
+        self.assertEqual(
+            set(request.kwargs["json"]["questions"]),
+            {specialist.name.value for specialist in SPECIALISTS.values()},
+        )
+        self.assertEqual(
+            request.kwargs["headers"]["Authorization"],
+            "Bearer test-openrouter-key",
+        )
+
+    def test_missing_openrouter_key_has_actionable_error(self) -> None:
+        settings = SimpleNamespace(
+            router_model="~typesafe/jev-latest",
+            openrouter_api_key=None,
+            openrouter_base_url="https://openrouter.ai/api/v1",
+        )
+        with self.assertRaisesRegex(RuntimeError, "OPENROUTER_API_KEY"):
+            assistant._build_intent_router_model(settings)
 
     def test_answer_question_sets_trace_metadata(self) -> None:
         class RecordingGraph:

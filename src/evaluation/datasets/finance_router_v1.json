@@ -1,0 +1,62 @@
+[
+  {
+    "query": "Explain compound interest in plain language and give a simple example.",
+    "route": "finance_qa",
+    "answer_criteria": "Explain how interest can earn interest, with a clear general example and no unsupported promises."
+  },
+  {
+    "query": "What is the difference between an ETF and a mutual fund?",
+    "route": "finance_qa",
+    "answer_criteria": "Compare the general structure and trading differences clearly, without recommending a particular fund."
+  },
+  {
+    "query": "I own 10 shares of AAPL and 5 shares of MSFT. Analyze the concentration and diversification of these holdings.",
+    "route": "portfolio_analysis",
+    "answer_criteria": "Use the supplied holdings for a portfolio-level analysis, discuss concentration and diversification, and avoid personalized trade recommendations."
+  },
+  {
+    "query": "Review this portfolio: 8 shares of NVDA and 12 shares of KO. What does it suggest about diversification?",
+    "route": "portfolio_analysis",
+    "answer_criteria": "Address the two supplied holdings and diversification limits; do not invent holdings or make specific trade recommendations."
+  },
+  {
+    "query": "Look up the latest MSFT quote and explain what the reported daily change means.",
+    "route": "market_analysis",
+    "answer_criteria": "Use current market data if available, distinguish live data from explanation, and disclose data limitations."
+  },
+  {
+    "query": "What company fundamentals should I review for NVDA? Please use current company data.",
+    "route": "market_analysis",
+    "answer_criteria": "Use current company information if available, explain relevant fundamentals, and avoid treating metrics as a buy or sell recommendation."
+  },
+  {
+    "query": "I want to save $12,000 over the next two years. What monthly savings target would get me there before interest?",
+    "route": "goal_planning",
+    "answer_criteria": "Calculate a simple monthly target from the stated amount and horizon, show assumptions, and avoid guaranteed returns."
+  },
+  {
+    "query": "Help me plan how to save $6,000 in 18 months if I can set aside about $300 each month.",
+    "route": "goal_planning",
+    "answer_criteria": "Compare the stated contribution with the goal and timeline, describe the shortfall or buffer, and offer educational next steps without promising returns."
+  },
+  {
+    "query": "Summarize recent financial news about the Federal Reserve and interest rates.",
+    "route": "news_synthesizer",
+    "answer_criteria": "Use current news sources when available, distinguish reported facts from interpretation, and cite returned source titles or links."
+  },
+  {
+    "query": "Find the latest financial news about inflation and explain the main market themes.",
+    "route": "news_synthesizer",
+    "answer_criteria": "Synthesize current news themes using available sources, distinguish facts from interpretation, and state when current sources are unavailable."
+  },
+  {
+    "query": "At a high level, how does a traditional IRA differ from a Roth IRA?",
+    "route": "tax_education",
+    "answer_criteria": "Explain general tax-treatment differences, note that rules depend on jurisdiction and tax year, and avoid individualized tax advice."
+  },
+  {
+    "query": "Explain how tax-advantaged retirement accounts generally work.",
+    "route": "tax_education",
+    "answer_criteria": "Describe the general concept of tax advantages, note that details vary by location and year, and avoid individualized tax or legal advice."
+  }
+]

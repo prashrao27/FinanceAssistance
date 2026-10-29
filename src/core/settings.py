@@ -21,6 +21,9 @@ load_dotenv(PROJECT_ROOT / ".env")
 class Settings:
     app_name: str
     llm_model: str
+    router_model: str
+    openrouter_api_key: str | None
+    openrouter_base_url: str
     mcp_server_url: str
     log_level: str
     data_directory: Path
@@ -74,6 +77,7 @@ def get_settings() -> Settings:
     config = _read_config()
     app = _section(config, "app")
     llm = _section(config, "llm")
+    router = _section(config, "router")
     mcp = _section(config, "mcp")
     logging_config = _section(config, "logging")
     langsmith = _section(config, "langsmith")
@@ -127,6 +131,19 @@ def get_settings() -> Settings:
     return Settings(
         app_name=str(app.get("name", "Finance Assistant")),
         llm_model=str(env_string("OPENAI_MODEL", llm.get("model", "gpt-4o-mini"))),
+        router_model=str(
+            env_string(
+                "OPENROUTER_MODEL",
+                router.get("model", "~typesafe/jev-latest"),
+            )
+        ),
+        openrouter_api_key=env_string("OPENROUTER_API_KEY"),
+        openrouter_base_url=str(
+            env_string(
+                "OPENROUTER_BASE_URL",
+                router.get("base_url", "https://openrouter.ai"),
+            )
+        ),
         mcp_server_url=str(
             env_string(
                 "MCP_SERVER_URL",
