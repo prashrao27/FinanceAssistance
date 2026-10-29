@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from pydantic import BaseModel, ConfigDict, Field
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -27,6 +28,28 @@ from utils.logging import configure_logging
 configure_logging()
 logger = logging.getLogger(__name__)
 mcp = FastMCP(get_settings().app_name)
+
+
+class PortfolioHoldingInput(BaseModel):
+    """Validated shape for a portfolio position passed to the MCP tool."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    symbol: str = Field(
+        min_length=1,
+        max_length=20,
+        pattern=r"^[A-Za-z0-9._-]+$",
+        description="Bare stock ticker, for example AAPL; do not include a company name or other text.",
+    )
+    quantity: float = Field(
+        gt=0,
+        description="Number of shares held; must be greater than zero.",
+    )
+    average_cost: float | None = Field(
+        default=None,
+        ge=0,
+        description="Optional average purchase price per share.",
+    )
 
 
 @mcp.tool()
@@ -63,9 +86,11 @@ def get_financial_news(
 
 
 @mcp.tool()
-def analyze_portfolio(holdings: list[dict[str, Any]]) -> dict[str, Any]:
-    """Summarize current portfolio value and allocation; not investment advice."""
-    return _analyze_portfolio(holdings)
+def analyze_portfolio(holdings: list[PortfolioHoldingInput]) -> dict[str, Any]:
+    """Analyze holdings using symbol, quantity, and optional average_cost only."""
+    return _analyze_portfolio(
+        [holding.model_dump(exclude_none=True) for holding in holdings]
+    )
 
 
 @mcp.tool()

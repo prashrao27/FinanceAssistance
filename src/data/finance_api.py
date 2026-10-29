@@ -268,7 +268,20 @@ def analyze_portfolio(
     for holding in holdings:
         if not isinstance(holding, dict):
             raise TypeError("Each holding must be an object")
-        symbol = _validate_symbol(str(holding.get("symbol", "")))
+        raw_symbol = holding.get("symbol")
+        if not isinstance(raw_symbol, str):
+            raise ValueError(
+                "Each holding requires a string 'symbol' containing only a bare "
+                "stock ticker, for example AAPL."
+            )
+        try:
+            symbol = _validate_symbol(raw_symbol)
+        except ValueError as exc:
+            raise ValueError(
+                "Each holding's 'symbol' must be a bare stock ticker containing "
+                "1 to 20 letters, numbers, periods, hyphens, or underscores "
+                "(for example AAPL); do not include a company name or extra text."
+            ) from exc
         quantity = holding.get("quantity")
         if isinstance(quantity, bool) or not isinstance(quantity, (int, float)):
             raise ValueError(f"{symbol} quantity must be numeric")

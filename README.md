@@ -9,7 +9,7 @@ from the repository root.
 ```text
 src/
 ├── agents/       # Six specialist definitions and workflow router
-├── core/         # Shared settings and application errors
+├── core/         # Settings, errors, and SQLite conversation/profile storage
 ├── data/         # Finance API, Qdrant adapters, and source PDFs
 ├── mcp_server/   # MCP transport and tool registration
 ├── rag/          # PDF parsing and dense/sparse embedding models
@@ -45,6 +45,11 @@ workflow; a web application package is reserved for future UI work.
 ```mermaid
 flowchart LR
     User[User] --> Workflow[LangGraph assistant workflow]
+    Workflow -->|user_id, thread_id| ConversationStore[SQLite conversation and profile store]
+    ConversationStore -->|recent turns| Workflow
+    ConversationStore -->|explicit learning profile| Workflow
+    User -->|profile edits and history commands| CLI[Interactive CLI]
+    CLI --> ConversationStore
     Workflow --> Router[LangChain intent router]
     Router --> Specialist[Selected finance specialist]
     Workflow --> MCP[MCP Streamable HTTP server]
@@ -58,33 +63,54 @@ flowchart LR
     Ingestion[PDF ingestion workflow] --> PDFs[Finance Q&A, news, tax PDFs]
     Ingestion --> Embedding
     Ingestion --> Qdrant
-    Workflow -. "traces and run metadata (planned)" .-> LangSmith[LangSmith tracing and evaluation]
+    Workflow -. "optional run traces" .-> LangSmith[LangSmith tracing]
     EvalSet[Curated evaluation dataset] -. "offline evaluation (planned)" .-> LangSmith
 ```
 
 ### Main runtime flow
 
-1. The workflow receives one user question.
-2. The router uses structured LLM output to select exactly one specialist.
-3. The workflow retrieves relevant chunks from Qdrant, filtered by the
-   selected specialist's document type.
-4. The selected specialist combines the question and retrieved context. Its
-   LangChain agent can call only the MCP tools assigned to that specialist.
-5. The MCP server executes the selected finance or knowledge operation.
-6. The specialist returns a response to the workflow and then to the caller.
+1. The CLI identifies the request with a `user_id` and `thread_id`. These IDs
+   select a profile and a conversation; they are labels, not authentication.
+2. Before invoking the graph, the workflow loads the user's explicit profile
+   and the configured number of latest turns for that thread from SQLite.
+   The full transcript remains stored.
+3. The router receives the current question and recent conversation turns,
+   then selects one specialist. The user's profile is supplied to the selected
+   specialist as context for adapting explanations and goals-based guidance.
+4. The workflow retrieves relevant Qdrant chunks using the current question
+   and recent conversation context, filtered by the selected specialist's
+   document type.
+5. The specialist combines the question, retrieved knowledge, recent turns,
+   and profile context. Its LangChain agent can call only its assigned MCP
+   tools; the MCP server executes those finance or knowledge operations.
+6. After a successful response, the workflow stores the question and answer
+   under that user and thread in SQLite. Failed requests are not added as
+   completed turns.
+7. The user can explicitly view, update, or delete their profile and view or
+   clear a conversation using CLI commands. Profile data is limited to
+   learning level, explanation preferences, and financial goals; holdings
+   and account details are not automatically retained.
 
-The current CLI accepts and answers a single question per process invocation.
-The LangGraph currently selects one specialist per question; it does not yet
-fan out to multiple specialists or serve a web UI.
+The local interactive CLI resumes history when the same user and conversation
+IDs are supplied after restarting. Choosing another conversation ID starts a
+separate thread, while the user's profile remains shared across their threads.
+The graph selects one specialist per question; it does not fan out to multiple
+specialists or serve a web UI.
 
-### Evaluation and observability (planned)
+Conversation history and profile data are stored locally in the configured
+SQLite database, independently from LangSmith traces. When tracing is enabled,
+the model inputs can include recent turns and profile context; operators
+should account for this data flow in their privacy and retention policies.
 
-LangSmith is the proposed observability and evaluation layer for the LangChain
-and LangGraph workflow. When enabled, trace records should capture the route
-decision, selected specialist, retrieval inputs/results, MCP tool calls, model
-runs, and final response. Tracing should be controlled by environment
-configuration and disabled by default unless an operator explicitly enables
-it.
+### Evaluation and observability
+
+The LangGraph workflow supports optional LangSmith tracing through LangChain's
+environment-based tracing integration. Set `LANGSMITH_TRACING=true` and provide
+`LANGSMITH_API_KEY` to send runs to LangSmith. The root workflow run is named
+`finance-assistant` and tagged `finance-assistant`; child graph nodes, model
+calls, and tool calls are included in the trace. `LANGSMITH_PROJECT` selects
+the destination project; the supplied `.env.example` sets it to
+`finance-assistant`.
 
 Offline evaluation should run separately from the interactive request path
 against a curated, versioned dataset of finance questions and expected
@@ -100,16 +126,16 @@ behavior. Evaluators should measure:
 
 Evaluation results can be compared across prompt, model, retrieval, and
 workflow changes and used as a release-quality check. They should not block or
-add latency to normal user requests. Dataset examples and traces must avoid
-unnecessary personally identifiable information or financial account data;
-only send data to LangSmith under the project's approved privacy and retention
-policy.
+add latency to normal user requests. Traces can contain the user's question,
+retrieved content, model output, and tool inputs/outputs. Do not send
+personally identifiable information or financial account data to LangSmith
+unless the project's privacy, consent, and retention policies permit it.
 
-**Implementation status:** LangSmith tracing, datasets, and evaluators are not
-currently configured in this repository. The diagram shows the planned
-integration, not a currently active service connection. Enabling it will
-require explicit LangSmith credentials/configuration and an evaluation
-dataset.
+**Implementation status:** Optional tracing is wired into the workflow.
+LangSmith credentials must be configured locally to send traces. Evaluation
+datasets and evaluators are not configured in this repository. Traces may
+include the current conversation history and saved profile context; avoid
+entering sensitive personal or financial information when tracing is enabled.
 
 ### Deployment boundaries
 
@@ -120,8 +146,8 @@ dataset.
 - **Qdrant:** stores PDF chunks, payload metadata, and named dense/sparse
   vectors.
 - **External services:** Alpha Vantage supplies market data; OpenAI supplies
-  router and specialist model inference. LangSmith is a planned optional
-  tracing/evaluation service and is not currently connected.
+  router and specialist model inference. LangSmith is an optional tracing
+  service enabled with environment settings.
 - **Ingestion:** a separately invoked batch workflow parses local PDFs,
   computes embeddings, and upserts points into Qdrant.
 
@@ -132,10 +158,11 @@ dataset.
 | Component | Responsibility |
 |---|---|
 | `core/settings.py` | Loads `config.yaml`, `.env`, and environment overrides into cached typed settings. |
+| `core/conversation_store.py` | Persists conversation turns and explicitly maintained learning profiles in SQLite. |
 | `core/errors.py` | Defines the shared application exception base. |
 | `agents/router.py` | Defines the structured route decision and routing instructions. |
 | `agents/specialists.py` | Defines the six specialist identities, prompts, knowledge filters, and allowed MCP tool names. |
-| `workflow/assistant.py` | Connects to MCP, builds specialist agents and the LangGraph, performs route → retrieval → specialist execution, and exposes the CLI. |
+| `workflow/assistant.py` | Loads recent history and user profile for routing and response context, runs route → retrieval → specialist execution, persists successful turns, and exposes the interactive CLI. |
 | `mcp_server/server.py` | Registers MCP tools and serves them using Streamable HTTP. |
 | `data/finance_api.py` | Validates finance API inputs, calls Alpha Vantage with retries, caching, and TLS verification; implements portfolio summary. |
 | `data/knowledge_service.py` | Embeds query text, performs dense and sparse Qdrant prefetch, fuses ranks with RRF, and caches search results. |
@@ -154,6 +181,8 @@ The graph state is `AssistantState`:
 | `route` | `str` | Selected `AgentType` value. |
 | `retrieved_context` | `str` | Serialized result from the `search_knowledge` MCP tool. |
 | `answer` | `str` | Specialist's final response. |
+| `conversation_history` | `list[dict[str, str]]` | Recent user/assistant turns for the current user and conversation. |
+| `user_profile` | `dict[str, Any]` | Explicit learning level, explanation preferences, and financial goals. |
 
 Graph topology:
 
@@ -167,6 +196,31 @@ specialists use LangChain `create_agent`; Finance Q&A and Tax Education call
 the chat model directly after retrieval because they have no additional
 specialist-specific MCP tools. All specialists still use the shared retrieval
 tool before answering.
+
+### Conversation history and user profiles
+
+`core/conversation_store.py` stores successful user/assistant turns and
+user-maintained profiles in `data/finance_assistant.sqlite3` by default.
+`storage.sqlite_path` and `storage.history_turns` in `config.yaml` configure
+the database location and how many recent turns are sent to the model. The
+complete conversation remains stored; only the configured recent turns are
+loaded into model context. Each turn is isolated by both `user_id` and
+`thread_id`; profiles are isolated by `user_id`.
+
+The profile contains only the fields the user explicitly enters: learning
+level, explanation preferences, and financial goals. Holdings and account
+details are not collected into the profile. In the CLI, `/profile` displays
+the current profile, `/profile set` edits it, and `/profile delete` removes it.
+`/history` displays the current conversation; `/clear-history` removes only
+that conversation's turns. Reuse the same IDs to resume history; choose a new
+conversation ID to begin a separate thread.
+
+The CLI's IDs are organizational labels, not authentication. This local SQLite
+implementation is intended for a single-user machine and does not provide
+multi-user access control or database encryption. The database file is created
+with owner-only permissions on supported systems and is ignored by Git. When
+LangSmith tracing is enabled, model context can include prior turns and profile
+fields, so consider disabling tracing for sensitive conversations.
 
 ### Specialist knowledge and tool mapping
 
@@ -232,10 +286,17 @@ stored in `config.yaml` or committed. Important settings include:
 
 - Model and MCP endpoint: `OPENAI_MODEL`, `MCP_SERVER_URL`.
 - Credentials: `OPENAI_API_KEY`, `ALPHA_VANTAGE_API_KEY`.
+- Optional tracing: enable `langsmith.tracing` in `config.yaml`, or override
+  it with `LANGSMITH_TRACING`; provide `LANGSMITH_API_KEY` in `.env`.
+  Project and endpoint defaults are configured under `langsmith` in
+  `config.yaml` and can be overridden with `LANGSMITH_PROJECT` and
+  `LANGSMITH_ENDPOINT`.
 - Qdrant: `QDRANT_URL`, `QDRANT_API_KEY`, `QDRANT_COLLECTION`.
 - Embeddings: `DENSE_EMBEDDING_MODEL`, `SPARSE_EMBEDDING_MODEL`.
 - Retrieval cache and limits: `SEARCH_CACHE_TTL_SECONDS`,
   `SEARCH_CACHE_MAX_ENTRIES`, `SEARCH_MAX_RESULTS`.
+- Conversation persistence: `CONVERSATION_DB_PATH`,
+  `CONVERSATION_HISTORY_TURNS`.
 
 ### Reliability, security, and limitations
 
@@ -267,6 +328,10 @@ Add credentials and service URLs to `.env`:
 - `QDRANT_URL` and `QDRANT_API_KEY` for knowledge search and ingestion.
 - `OPENAI_API_KEY` for the LangChain router and specialist agents. `OPENAI_MODEL`
   selects the chat model.
+- Optional LangSmith tracing: set `langsmith.tracing: true` in `config.yaml`
+  and provide your `LANGSMITH_API_KEY` in `.env`. The config sets project and
+  endpoint defaults; environment variables can override them. Tracing is
+  disabled by setting `langsmith.tracing: false` or `LANGSMITH_TRACING=false`.
 
 Never commit `.env` or real credentials. Non-secret defaults, such as model
 names, collection name, retrieval limits, and logging level, live in
@@ -291,11 +356,43 @@ Start the MCP server first, then in another terminal run:
 PYTHONPATH=src .venv/bin/python -m workflow.assistant
 ```
 
-The workflow connects to the MCP Streamable HTTP endpoint at
-`MCP_SERVER_URL`, retrieves relevant knowledge for the selected specialist,
-and returns its answer. Market, portfolio, and news specialists may call only
-their assigned MCP tools. It requires `OPENAI_API_KEY`; data-dependent MCP tools
-also require their API/Qdrant configuration.
+The CLI asks for a user ID and conversation ID; accept the defaults to resume
+the default local conversation, or use distinct IDs for separate users and
+threads. It then accepts questions until `/quit`. Use `/profile`, `/profile set`,
+`/profile delete`, `/history`, and `/clear-history` to manage saved data.
+The workflow connects to `MCP_SERVER_URL`, retrieves relevant knowledge, and
+uses recent conversation history and the explicit profile as context. Market,
+portfolio, and news specialists may call only their assigned MCP tools. It
+requires `OPENAI_API_KEY`; data-dependent MCP tools also require their
+API/Qdrant configuration.
+
+### Manually test persistent conversation history
+
+1. Start the MCP server and assistant. When prompted, use a test user ID such
+   as `history-test-user` and conversation ID `history-test-thread`.
+2. Ask: `I am learning about retirement accounts. Explain a Roth IRA simply.`
+   Wait for the assistant's answer.
+3. Ask a follow-up that relies on the earlier turn:
+   `Compare that with a traditional IRA, and remind me which account I asked about first.`
+   The answer should use the current question and earlier conversation context.
+4. Enter `/history`. Both completed question/answer pairs should be listed.
+5. Enter `/quit`, restart the assistant, and enter the **same** user and
+   conversation IDs. Enter `/history`; the turns should still be there. Ask
+   another follow-up to check that the prior turns are passed back as context.
+6. Quit and restart with the same user ID but a different conversation ID.
+   `/history` should report no saved turns for that thread.
+
+To check persistence and isolation without making model or MCP calls, run the
+store unit tests:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m unittest tests.test_conversation_store -v
+```
+
+The test verifies that turns survive reopening the SQLite database, stay
+scoped to the requested user and conversation IDs, and can be cleared per
+conversation. The workflow tests also check that prior turns and explicit
+profile fields are included in model context.
 
 ## Ingest the PDF knowledge base
 

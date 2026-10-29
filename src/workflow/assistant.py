@@ -10,20 +10,22 @@ from pathlib import Path
 from typing import Any, TypedDict
 
 from langchain.agents import create_agent
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.graph import END, START, StateGraph
 from langchain_openai import ChatOpenAI
+from langsmith import tracing_context
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agents.router import ROUTER_INSTRUCTIONS, RouteDecision
 from agents.specialists import AgentType, SPECIALISTS
+from core.conversation_store import ConversationStore, UserProfile
 from core.settings import get_settings
 from utils.logging import configure_logging
-
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,8 @@ class AssistantState(TypedDict):
     route: str
     retrieved_context: str
     answer: str
+    conversation_history: list[dict[str, str]]
+    user_profile: dict[str, Any]
 
 
 def _tool_name(tool: BaseTool) -> str:
@@ -59,6 +63,38 @@ def _answer_text(result: dict[str, Any]) -> str:
     if isinstance(content, str):
         return content
     return _format_tool_result(content)
+
+
+def _history_messages(history: list[dict[str, str]]) -> list[Any]:
+    messages = []
+    for turn in history:
+        messages.extend(
+            [
+                HumanMessage(content=turn["query"]),
+                AIMessage(content=turn["answer"]),
+            ]
+        )
+    return messages
+
+
+def _profile_context(profile_data: dict[str, Any]) -> str:
+    if not profile_data:
+        return ""
+    profile = UserProfile(
+        learning_level=profile_data.get("learning_level"),
+        explanation_preferences=profile_data.get("explanation_preferences"),
+        financial_goals=tuple(profile_data.get("financial_goals", ())),
+    )
+    sections = ["Saved user profile (user-provided context):"]
+    if profile.learning_level:
+        sections.append(f"- Learning level: {profile.learning_level}")
+    if profile.explanation_preferences:
+        sections.append(
+            f"- Explanation preferences: {profile.explanation_preferences}"
+        )
+    if profile.financial_goals:
+        sections.append(f"- Financial goals: {'; '.join(profile.financial_goals)}")
+    return "\n".join(sections) if len(sections) > 1 else ""
 
 
 async def build_assistant_graph(
@@ -131,15 +167,22 @@ async def build_assistant_graph(
             definition: Any = specialist,
             compiled_agent: Any = agent,
         ) -> dict[str, str]:
+            profile_context = _profile_context(state["user_profile"])
             contextual_query = (
+                f"{profile_context}\n\n" if profile_context else ""
+            ) + (
                 "Retrieved knowledge context:\n"
                 f"{state['retrieved_context']}\n\n"
                 f"User question:\n{state['query']}"
+            )
+            conversation_messages = _history_messages(
+                state["conversation_history"]
             )
             if compiled_agent is None:
                 response = await model.ainvoke(
                     [
                         SystemMessage(content=definition.system_prompt),
+                        *conversation_messages,
                         HumanMessage(content=contextual_query),
                     ]
                 )
@@ -148,7 +191,12 @@ async def build_assistant_graph(
                     answer = _format_tool_result(answer)
             else:
                 response = await compiled_agent.ainvoke(
-                    {"messages": [HumanMessage(content=contextual_query)]}
+                    {
+                        "messages": [
+                            *conversation_messages,
+                            HumanMessage(content=contextual_query),
+                        ]
+                    }
                 )
                 answer = _answer_text(response)
             return {"answer": answer}
@@ -159,6 +207,7 @@ async def build_assistant_graph(
         decision = await router.ainvoke(
             [
                 SystemMessage(content=ROUTER_INSTRUCTIONS),
+                *_history_messages(state["conversation_history"]),
                 HumanMessage(content=state["query"]),
             ]
         )
@@ -175,9 +224,19 @@ async def build_assistant_graph(
 
     async def retrieve_context(state: AssistantState) -> dict[str, str]:
         specialist = SPECIALISTS[AgentType(state["route"])]
+        recent_context = "\n".join(
+            f"Previous question: {turn['query']}\n"
+            f"Previous answer: {turn['answer']}"
+            for turn in state["conversation_history"][-2:]
+        )
+        retrieval_query = (
+            f"{recent_context}\nCurrent question: {state['query']}"
+            if recent_context
+            else state["query"]
+        )
         result = await retrieval_tool.ainvoke(
             {
-                "query": state["query"],
+                "query": retrieval_query,
                 "doc_types": (
                     list(specialist.doc_types) if specialist.doc_types is not None else None
                 ),
@@ -210,29 +269,149 @@ async def build_assistant_graph(
     return graph.compile()
 
 
-async def answer_question(query: str, *, graph: Any | None = None) -> str:
-    """Route one question through RAG and the selected specialist."""
+async def answer_question(
+    query: str,
+    *,
+    user_id: str = "local-user",
+    thread_id: str = "default",
+    graph: Any | None = None,
+    store: ConversationStore | None = None,
+) -> str:
+    """Answer in a persistent user conversation and save successful turns."""
     if not query.strip():
         raise ValueError("query cannot be empty")
-    assistant = graph or await build_assistant_graph()
-    state = await assistant.ainvoke(
-        {
-            "query": query.strip(),
-            "route": "",
-            "retrieved_context": "",
-            "answer": "",
-        }
+    settings = get_settings()
+    conversation_store = store or ConversationStore(settings.conversation_db_path)
+    history = conversation_store.get_history(
+        user_id,
+        thread_id,
+        limit=settings.conversation_history_turns,
     )
-    return state["answer"]
+    profile = conversation_store.get_profile(user_id)
+    assistant = graph or await build_assistant_graph()
+    with tracing_context(
+        enabled=settings.langsmith_tracing,
+        project_name=settings.langsmith_project,
+    ):
+        state = await assistant.ainvoke(
+            {
+                "query": query.strip(),
+                "route": "",
+                "retrieved_context": "",
+                "answer": "",
+                "conversation_history": history,
+                "user_profile": {
+                    "learning_level": profile.learning_level,
+                    "explanation_preferences": profile.explanation_preferences,
+                    "financial_goals": list(profile.financial_goals),
+                },
+            },
+            config=RunnableConfig(
+                run_name="finance-assistant",
+                tags=["finance-assistant"],
+                metadata={"workflow": "route-retrieve-answer"},
+            ),
+        )
+    answer = state["answer"]
+    conversation_store.append_turn(user_id, thread_id, query.strip(), answer)
+    return answer
 
 
 async def main() -> None:
-    """Read one question from stdin and print the specialist response."""
+    """Run an interactive CLI with persistent local history and profile commands."""
     configure_logging()
-    query = input("Finance question: ").strip()
-    if not query:
-        raise ValueError("Enter a non-empty finance question.")
-    print(await answer_question(query))
+    user_id = input("User ID [local-user]: ").strip() or "local-user"
+    thread_id = input("Conversation ID [default]: ").strip() or "default"
+    settings = get_settings()
+    store = ConversationStore(settings.conversation_db_path)
+    graph: Any | None = None
+
+    while True:
+        entry = input(
+            "Finance question (/profile, /profile set, /history, "
+            "/clear-history, /quit): "
+        ).strip()
+        if entry in {"/quit", "/exit"}:
+            return
+        if entry == "/profile":
+            profile = store.get_profile(user_id)
+            print(f"Learning level: {profile.learning_level or '(not set)'}")
+            print(
+                "Explanation preferences: "
+                f"{profile.explanation_preferences or '(not set)'}"
+            )
+            print(
+                "Financial goals: "
+                f"{'; '.join(profile.financial_goals) or '(not set)'}"
+            )
+            continue
+        if entry == "/profile set":
+            profile = store.get_profile(user_id)
+            learning_level = input(
+                f"Learning level [{profile.learning_level or 'not set'}] "
+                "(blank keeps, 'clear' removes): "
+            ).strip()
+            preferences = input(
+                f"Explanation preferences "
+                f"[{profile.explanation_preferences or 'not set'}] "
+                "(blank keeps, 'clear' removes): "
+            ).strip()
+            goals = input(
+                f"Financial goals [{'; '.join(profile.financial_goals) or 'not set'}] "
+                "(comma-separated, blank keeps, 'clear' removes): "
+            ).strip()
+            normalized_goals = (
+                []
+                if goals.lower() == "clear"
+                else [goal.strip() for goal in goals.split(",")]
+                if goals
+                else None
+            )
+            store.update_profile(
+                user_id,
+                learning_level=(
+                    "" if learning_level.lower() == "clear" else learning_level or None
+                ),
+                explanation_preferences=(
+                    "" if preferences.lower() == "clear" else preferences or None
+                ),
+                financial_goals=normalized_goals,
+            )
+            print("Profile saved.")
+            continue
+        if entry == "/profile delete":
+            if input("Delete the saved profile? [y/N]: ").strip().lower() == "y":
+                print(
+                    "Profile deleted."
+                    if store.delete_profile(user_id)
+                    else "No profile was saved."
+                )
+            continue
+        if entry == "/history":
+            turns = store.get_history(user_id, thread_id)
+            if not turns:
+                print("No saved turns in this conversation.")
+            for turn in turns:
+                print(f"\nYou: {turn['query']}\nAssistant: {turn['answer']}")
+            continue
+        if entry == "/clear-history":
+            if input("Delete this conversation's history? [y/N]: ").strip().lower() == "y":
+                deleted = store.clear_history(user_id, thread_id)
+                print(f"Deleted {deleted} saved turn(s).")
+            continue
+        if not entry:
+            continue
+        if graph is None:
+            graph = await build_assistant_graph()
+        print(
+            await answer_question(
+                entry,
+                user_id=user_id,
+                thread_id=thread_id,
+                graph=graph,
+                store=store,
+            )
+        )
 
 
 if __name__ == "__main__":

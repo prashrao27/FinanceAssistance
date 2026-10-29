@@ -24,11 +24,17 @@ class Settings:
     mcp_server_url: str
     log_level: str
     data_directory: Path
+    conversation_db_path: Path
+    conversation_history_turns: int
     qdrant_url: str | None
     qdrant_api_key: str | None
     qdrant_collection: str
     openai_api_key: str | None
     alpha_vantage_api_key: str | None
+    langsmith_tracing: bool
+    langsmith_api_key: str | None
+    langsmith_project: str
+    langsmith_endpoint: str | None
     dense_embedding_model: str
     sparse_embedding_model: str
     search_cache_ttl_seconds: int
@@ -70,6 +76,8 @@ def get_settings() -> Settings:
     llm = _section(config, "llm")
     mcp = _section(config, "mcp")
     logging_config = _section(config, "logging")
+    langsmith = _section(config, "langsmith")
+    storage = _section(config, "storage")
     data = _section(config, "data")
     qdrant = _section(config, "qdrant")
     rag = _section(config, "rag")
@@ -87,11 +95,34 @@ def get_settings() -> Settings:
         except (TypeError, ValueError) as exc:
             raise ValueError(f"{name} must be an integer") from exc
 
+    def env_boolean(name: str, default: bool) -> bool:
+        value = os.environ.get(name)
+        if value is None:
+            return default
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+        raise ValueError(f"{name} must be a boolean")
+
+    langsmith_tracing_default = langsmith.get("tracing", False)
+    if not isinstance(langsmith_tracing_default, bool):
+        raise ValueError("config.yaml langsmith.tracing must be a boolean")
+
     data_directory = Path(
         env_string("DATA_DIRECTORY", data.get("directory", "src/data"))
     )
     if not data_directory.is_absolute():
         data_directory = PROJECT_ROOT / data_directory
+    conversation_db_path = Path(
+        env_string(
+            "CONVERSATION_DB_PATH",
+            storage.get("sqlite_path", "data/finance_assistant.sqlite3"),
+        )
+    )
+    if not conversation_db_path.is_absolute():
+        conversation_db_path = PROJECT_ROOT / conversation_db_path
 
     return Settings(
         app_name=str(app.get("name", "Finance Assistant")),
@@ -104,6 +135,10 @@ def get_settings() -> Settings:
         ),
         log_level=str(env_string("LOG_LEVEL", logging_config.get("level", "INFO"))),
         data_directory=data_directory,
+        conversation_db_path=conversation_db_path,
+        conversation_history_turns=env_integer(
+            "CONVERSATION_HISTORY_TURNS", storage.get("history_turns", 12)
+        ),
         qdrant_url=env_string("QDRANT_URL"),
         qdrant_api_key=env_string("QDRANT_API_KEY"),
         qdrant_collection=str(
@@ -111,6 +146,17 @@ def get_settings() -> Settings:
         ),
         openai_api_key=env_string("OPENAI_API_KEY"),
         alpha_vantage_api_key=env_string("ALPHA_VANTAGE_API_KEY"),
+        langsmith_tracing=env_boolean("LANGSMITH_TRACING", langsmith_tracing_default),
+        langsmith_api_key=env_string("LANGSMITH_API_KEY"),
+        langsmith_project=str(
+            env_string(
+                "LANGSMITH_PROJECT",
+                langsmith.get("project", "finance-assistant"),
+            )
+        ),
+        langsmith_endpoint=env_string(
+            "LANGSMITH_ENDPOINT", langsmith.get("endpoint")
+        ),
         dense_embedding_model=str(
             env_string(
                 "DENSE_EMBEDDING_MODEL",

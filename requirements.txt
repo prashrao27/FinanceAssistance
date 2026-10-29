@@ -16,3 +16,4 @@ langchain>=1.0.0,<2.0.0
 langchain-openai>=1.0.0,<2.0.0
 langchain-mcp-adapters>=0.1.0,<1.0.0
 langgraph>=1.0.0,<2.0.0
+langsmith>=0.3.45,<1.0.0

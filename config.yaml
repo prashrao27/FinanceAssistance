@@ -10,8 +10,17 @@ mcp:
 logging:
   level: INFO
 
+langsmith:
+  tracing: true
+  project: FinanceAssistance
+  endpoint: https://api.smith.langchain.com
+
 data:
   directory: src/data
+
+storage:
+  sqlite_path: data/finance_assistant.sqlite3
+  history_turns: 12
 
 qdrant:
   collection: FinAi

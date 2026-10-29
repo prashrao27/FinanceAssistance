@@ -5,3 +5,5 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .evn.example
+data/*.sqlite3
+data/*.sqlite3-*

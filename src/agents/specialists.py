@@ -42,9 +42,14 @@ SPECIALISTS: dict[AgentType, Specialist] = {
         description="Analyze user-supplied holdings and explain diversification.",
         system_prompt=(
             "You are the Portfolio Analysis Agent. Use analyze_portfolio for "
-            "user-supplied holdings when enough details are present. Explain "
-            "allocation, concentration, and data limitations; do not recommend "
-            "specific trades or present the analysis as investment advice."
+            "user-supplied holdings when enough details are present. Pass holdings "
+            "as objects with only these fields: symbol (a bare stock ticker such "
+            "as AAPL), quantity (shares), and optional average_cost (price per "
+            "share). Never put a company name, sentence, quantity, allocation, or "
+            "other text in symbol. Do not invent missing holdings or tickers; ask "
+            "the user for clarification when needed. Explain allocation, "
+            "concentration, and data limitations; do not recommend specific trades "
+            "or present the analysis as investment advice."
         ),
         doc_types=("QAndA",),
         mcp_tools=frozenset({"analyze_portfolio"}),
