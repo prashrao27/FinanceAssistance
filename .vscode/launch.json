@@ -15,6 +15,19 @@
       "justMyCode": true
     },
     {
+      "name": "Python: Debug assistant",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "workflow.assistant",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src"
+      },
+      "console": "integratedTerminal",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "justMyCode": true
+    },
+    {
       "name": "Python: Run current file (.venv)",
       "type": "debugpy",
       "request": "launch",

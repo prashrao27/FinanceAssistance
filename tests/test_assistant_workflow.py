@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,13 +10,15 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import httpx
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 
 from agents.router import RouteDecision
 from agents.specialists import AgentType, SPECIALISTS
 from workflow import assistant
 
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).parent))
 
 class FakeRouter:
     def __init__(self, agent: AgentType) -> None:
@@ -43,12 +46,22 @@ class FakeModel:
 
     async def ainvoke(self, messages: list[Any]) -> AIMessage:
         self.invocations.append(messages)
-        return AIMessage(content="Grounded finance education answer.")
+        return AIMessage(
+            content=(
+                "Grounded finance education answer.\n\n"
+                "Sources:\n- [S1] model-generated source"
+            )
+        )
 
 
 class FakeAgent:
+    def __init__(self, messages: list[Any] | None = None) -> None:
+        self.messages = messages or [
+            AIMessage(content="Specialist tool-backed answer.")
+        ]
+
     async def ainvoke(self, state: dict[str, Any]) -> dict[str, Any]:
-        return {"messages": [AIMessage(content="Specialist tool-backed answer.")]}
+        return {"messages": self.messages}
 
 
 class AssistantWorkflowTests(unittest.TestCase):
@@ -63,7 +76,12 @@ class AssistantWorkflowTests(unittest.TestCase):
             self.retrieval_calls.append(
                 {"query": query, "doc_types": doc_types, "limit": limit}
             )
-            return '{"results":[{"text":"Retrieved test context"}]}'
+            return (
+                '{"results":[{"text":"Retrieved test context","metadata":'
+                '{"document_title":"Personal Finance Guide",'
+                '"source_file":"finance-guide.pdf","page_start":3,'
+                '"page_end":4,"section_path":["Saving","Budget"]}}]}'
+            )
 
         def no_op(value: str = "") -> str:
             return value
@@ -126,7 +144,16 @@ class AssistantWorkflowTests(unittest.TestCase):
             result, model, intent_model = asyncio.run(run())
 
         self.assertEqual(result["route"], AgentType.TAX_EDUCATION.value)
-        self.assertEqual(result["answer"], "Grounded finance education answer.")
+        self.assertTrue(
+            result["answer"].startswith("Grounded finance education answer.")
+        )
+        self.assertIn(
+            "Sources:\n- [S1] Personal Finance Guide, PDF: finance-guide.pdf, "
+            "pp. 3-4, section: Saving > Budget",
+            result["answer"],
+        )
+        self.assertEqual(result["answer"].count("Sources:"), 1)
+        self.assertNotIn("model-generated source", result["answer"])
         self.assertIn(
             "What is a Roth account?",
             intent_model.router.messages[1].content,
@@ -140,13 +167,58 @@ class AssistantWorkflowTests(unittest.TestCase):
         self.assertIn("Learning level: beginner", specialist_messages[-1].content)
         self.assertIn("Save for retirement", specialist_messages[-1].content)
         self.assertIn("Explain tax-advantaged accounts", specialist_messages[-1].content)
+        self.assertIn("[S1] Personal Finance Guide", specialist_messages[-1].content)
+        self.assertIn("Cite PDF-supported claims", specialist_messages[-1].content)
         self.assertEqual(
             self.retrieval_calls[0]["query"].splitlines()[-1],
-            "Current question: Explain tax-advantaged accounts",
+            "Explain tax-advantaged accounts",
         )
         self.assertEqual(self.retrieval_calls[0]["doc_types"], ["TaxEducation"])
         self.assertEqual(self.retrieval_calls[0]["limit"], 5)
         create_agent.assert_called()
+
+    def test_response_lists_pdf_and_external_api_sources(self) -> None:
+        async def run() -> dict[str, Any]:
+            model = FakeModel(AgentType.MARKET_ANALYSIS)
+            graph = await assistant.build_assistant_graph(
+                model=model,
+                router_model=FakeModel(AgentType.MARKET_ANALYSIS),
+                mcp_tools=self.tools,
+            )
+            return await graph.ainvoke(
+                {
+                    "query": "Get the latest NVDA stock quote",
+                    "route": "",
+                    "retrieved_context": "",
+                    "source_attributions": [],
+                    "answer": "",
+                    "conversation_history": [],
+                    "user_profile": {},
+                }
+            )
+
+        with patch.object(
+            assistant,
+            "create_agent",
+            return_value=FakeAgent(
+                [
+                    ToolMessage(
+                        content='{"symbol":"NVDA","price":100}',
+                        tool_call_id="quote-1",
+                        name="get_stock_quote",
+                    ),
+                    AIMessage(content="NVDA's latest quote is $100."),
+                ]
+            ),
+        ):
+            result = asyncio.run(run())
+
+        self.assertIn("PDF: finance-guide.pdf", result["answer"])
+        self.assertIn(
+            "External API: Alpha Vantage (stock quote)",
+            result["answer"],
+        )
+        self.assertEqual(result["answer"].count("Sources:"), 1)
 
     def test_specialist_tool_assignments_are_scoped(self) -> None:
         self.assertEqual(
@@ -162,6 +234,125 @@ class AssistantWorkflowTests(unittest.TestCase):
                     "get_daily_stock_prices",
                 }
             ),
+        )
+
+    def test_retrieval_source_filename_falls_back_to_document_type(self) -> None:
+        context, sources = assistant._format_retrieval_context(
+            {
+                "results": [
+                    {
+                        "text": "Tax rules depend on the tax year.",
+                        "metadata": {"DocType": "TaxEducation"},
+                    }
+                ]
+            }
+        )
+
+        self.assertIn("PDF: tax_education.pdf", context)
+        self.assertEqual(
+            sources,
+            ["[S1] PDF: tax_education.pdf"],
+        )
+
+    def test_retrieval_source_filename_uses_specialist_doc_type_without_metadata(
+        self,
+    ) -> None:
+        context, sources = assistant._format_retrieval_context(
+            {
+                "results": [
+                    {
+                        "text": "Tax rules depend on the tax year.",
+                    }
+                ]
+            },
+            fallback_doc_type="TaxEducation",
+        )
+
+        self.assertIn("PDF: tax_education.pdf", context)
+        self.assertEqual(
+            sources,
+            ["[S1] PDF: tax_education.pdf"],
+        )
+
+    def test_retrieval_context_limits_results_and_excerpt_length(self) -> None:
+        context, sources = assistant._format_retrieval_context(
+            {
+                "results": [
+                    {
+                        "text": f"Relevant excerpt {index}. " + ("x" * 2_000),
+                        "metadata": {
+                            "source_file": f"source-{index}.pdf",
+                            "DocType": "TaxEducation",
+                        },
+                    }
+                    for index in range(6)
+                ]
+            }
+        )
+
+        self.assertEqual(len(sources), assistant._MAX_RETRIEVAL_RESULTS_IN_PROMPT)
+        self.assertIn("[S4] PDF: source-3.pdf", context)
+        self.assertNotIn("source-4.pdf", context)
+        self.assertLessEqual(
+            len(context),
+            assistant._MAX_RETRIEVAL_RESULTS_IN_PROMPT
+            * (assistant._MAX_RETRIEVAL_EXCERPT_CHARS + 100),
+        )
+
+    def test_history_prompt_keeps_only_recent_truncated_turns(self) -> None:
+        history = [
+            {"query": f"question {index}", "answer": f"answer {index}"}
+            for index in range(4)
+        ]
+        history[-1]["answer"] = "a" * (assistant._MAX_HISTORY_MESSAGE_CHARS + 100)
+
+        messages = assistant._history_messages(history)
+
+        self.assertEqual(len(messages), 4)
+        self.assertEqual(messages[0].content, "question 2")
+        self.assertEqual(messages[-1].content[-3:], "...")
+        self.assertLessEqual(
+            len(messages[-1].content),
+            assistant._MAX_HISTORY_MESSAGE_CHARS,
+        )
+
+    def test_retrieval_query_uses_prior_question_only_for_follow_up(self) -> None:
+        history = [
+            {
+                "query": "Explain Roth IRA contributions",
+                "answer": "Long answer that should not be sent into retrieval.",
+            }
+        ]
+
+        focused = assistant._retrieval_query("Explain traditional IRAs", history)
+        follow_up = assistant._retrieval_query("How does that compare?", history)
+
+        self.assertEqual(focused, "Explain traditional IRAs")
+        self.assertIn("Current question: How does that compare?", follow_up)
+        self.assertIn("Related prior question: Explain Roth IRA contributions", follow_up)
+        self.assertNotIn("Long answer", follow_up)
+
+    def test_retrieval_formatter_unwraps_mcp_text_blocks(self) -> None:
+        context, sources = assistant._format_retrieval_context(
+            [
+                {
+                    "type": "text",
+                    "text": (
+                        '{"query":"tax account types","results":[{"text":'
+                        '"Tax rules depend on the tax year.","metadata":'
+                        '{"DocType":"TaxEducation","page_start":5}}]}'
+                    ),
+                }
+            ],
+            fallback_doc_type="TaxEducation",
+        )
+
+        self.assertIn("Tax rules depend on the tax year.", context)
+        self.assertIn("PDF: tax_education.pdf", context)
+        self.assertIn("p. 5", context)
+        self.assertEqual(
+            sources,
+            ["[S1] PDF: tax_education.pdf, p. 5"],
         )
 
     def test_builds_intent_router_with_openrouter_settings(self) -> None:

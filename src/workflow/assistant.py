@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 from typing import Any, Literal, TypedDict
@@ -12,7 +13,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from langchain.agents import create_agent
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -27,12 +28,29 @@ if not __package__:
 from agents.router import ROUTER_INSTRUCTIONS, RouteDecision
 from agents.specialists import AgentType, SPECIALISTS
 from core.conversation_store import ConversationStore, UserProfile
+from core.knowledge_sources import KNOWLEDGE_SOURCE_FILES
 from core.settings import get_settings
 from utils.logging import configure_logging
 
 logger = logging.getLogger(__name__)
 
 _RETRIEVAL_TOOL_NAME = "search_knowledge"
+_MAX_HISTORY_TURNS_IN_PROMPT = 2
+_MAX_HISTORY_MESSAGE_CHARS = 1_200
+_MAX_RETRIEVAL_RESULTS_IN_PROMPT = 4
+_MAX_RETRIEVAL_EXCERPT_CHARS = 1_800
+_FOLLOW_UP_REFERENCE_PATTERN = re.compile(
+    r"\b(?:it|that|those|these|they|them|same|former|latter)\b|"
+    r"\bwhat about\b|\bcompare (?:it|that|those|these|with)\b",
+    re.IGNORECASE,
+)
+_EXTERNAL_API_TOOL_SOURCES = {
+    "get_stock_quote": "External API: Alpha Vantage (stock quote)",
+    "get_company_overview": "External API: Alpha Vantage (company overview)",
+    "get_daily_stock_prices": "External API: Alpha Vantage (daily stock prices)",
+    "get_financial_news": "External API: Alpha Vantage (financial news)",
+    "analyze_portfolio": "External API: Alpha Vantage (portfolio quotes)",
+}
 
 
 class _JevAnswer(BaseModel):
@@ -48,6 +66,7 @@ class AssistantState(TypedDict):
     query: str
     route: str
     retrieved_context: str
+    source_attributions: list[str]
     answer: str
     conversation_history: list[dict[str, str]]
     user_profile: dict[str, Any]
@@ -67,6 +86,140 @@ def _format_tool_result(result: Any) -> str:
         return str(result)
 
 
+def _limit_prompt_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return f"{text[: max_chars - 3].rstrip()}..."
+
+
+def _format_retrieval_context(
+    result: Any,
+    *,
+    fallback_doc_type: str | None = None,
+) -> tuple[str, list[str]]:
+    if isinstance(result, list):
+        parsed_results: list[dict[str, Any]] = []
+        text_blocks = [
+            block["text"]
+            for block in result
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
+        for text in text_blocks:
+            try:
+                block_result = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(block_result, dict) and isinstance(
+                block_result.get("results"), list
+            ):
+                parsed_results.extend(
+                    item
+                    for item in block_result["results"]
+                    if isinstance(item, dict)
+                )
+        if parsed_results:
+            result = {"results": parsed_results}
+        elif len(text_blocks) == 1:
+            result = text_blocks[0]
+
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except json.JSONDecodeError:
+            return result, []
+    if not isinstance(result, dict) or not isinstance(result.get("results"), list):
+        return _format_tool_result(result), []
+
+    chunks: list[str] = []
+    source_attributions: list[str] = []
+    for index, item in enumerate(
+        result["results"][:_MAX_RETRIEVAL_RESULTS_IN_PROMPT],
+        start=1,
+    ):
+        if not isinstance(item, dict):
+            continue
+        metadata = item.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        title = str(metadata.get("document_title") or "").strip()
+        source_file = str(metadata.get("source_file") or "").strip()
+        if not source_file:
+            doc_type = str(metadata.get("DocType") or fallback_doc_type or "").strip()
+            source_file = KNOWLEDGE_SOURCE_FILES.get(doc_type, "")
+        source_url = str(
+            metadata.get("source_url") or metadata.get("url") or ""
+        ).strip()
+        source_name = title
+        if source_file:
+            source_name = (
+                f"{source_name}, PDF: {source_file}"
+                if source_name and source_name != source_file
+                else f"PDF: {source_file}"
+            )
+
+        citation = f"[S{index}] {source_name}" if source_name else ""
+        page_start = metadata.get("page_start")
+        page_end = metadata.get("page_end")
+        if page_start is not None:
+            if page_end is not None and page_end != page_start:
+                citation += f", pp. {page_start}-{page_end}"
+            else:
+                citation += f", p. {page_start}"
+
+        section_path = metadata.get("section_path")
+        if isinstance(section_path, list):
+            section = " > ".join(str(part) for part in section_path if part)
+        elif section_path:
+            section = str(section_path)
+        else:
+            section = str(metadata.get("section_title") or "").strip()
+        if section and citation:
+            citation += f", section: {section}"
+        if source_url and citation:
+            citation += f", URL: {source_url}"
+
+        text = item.get("text", "")
+        excerpt = text if isinstance(text, str) else _format_tool_result(text)
+        excerpt = _limit_prompt_text(excerpt, _MAX_RETRIEVAL_EXCERPT_CHARS)
+        if citation:
+            source_attributions.append(citation)
+            chunks.append(f"{citation}\nExcerpt:\n{excerpt}")
+        else:
+            chunks.append(f"Retrieved excerpt:\n{excerpt}")
+
+    if not chunks:
+        return _format_tool_result(result), []
+    return "\n\n".join(chunks), source_attributions
+
+
+def _append_source_attributions(answer: str, source_attributions: list[str]) -> str:
+    if not source_attributions:
+        return answer
+
+    answer_body = re.split(
+        r"(?im)^\s*(?:#{1,6}\s*)?(?:\*\*)?sources(?:\*\*)?\s*:\s*$",
+        answer,
+        maxsplit=1,
+    )[0].rstrip()
+    sources = "\n".join(f"- {source}" for source in source_attributions)
+    if not answer_body:
+        return f"Sources:\n{sources}"
+    return f"{answer_body}\n\nSources:\n{sources}"
+
+
+def _external_api_attributions(messages: list[Any]) -> list[str]:
+    attributions: list[str] = []
+    for message in messages:
+        if not isinstance(message, ToolMessage) or message.status == "error":
+            continue
+        tool_name = str(message.name or "").rsplit("__", maxsplit=1)[-1]
+        source = _EXTERNAL_API_TOOL_SOURCES.get(tool_name)
+        if source and source not in attributions:
+            attributions.append(source)
+    return attributions
+
+
 def _answer_text(result: dict[str, Any]) -> str:
     messages = result.get("messages", [])
     if not messages:
@@ -79,14 +232,35 @@ def _answer_text(result: dict[str, Any]) -> str:
 
 def _history_messages(history: list[dict[str, str]]) -> list[Any]:
     messages = []
-    for turn in history:
+    for turn in history[-_MAX_HISTORY_TURNS_IN_PROMPT:]:
         messages.extend(
             [
-                HumanMessage(content=turn["query"]),
-                AIMessage(content=turn["answer"]),
+                HumanMessage(
+                    content=_limit_prompt_text(
+                        turn["query"],
+                        _MAX_HISTORY_MESSAGE_CHARS,
+                    )
+                ),
+                AIMessage(
+                    content=_limit_prompt_text(
+                        turn["answer"],
+                        _MAX_HISTORY_MESSAGE_CHARS,
+                    )
+                ),
             ]
         )
     return messages
+
+
+def _retrieval_query(query: str, history: list[dict[str, str]]) -> str:
+    """Keep normal searches focused; add prior query only for clear follow-ups."""
+    if not history or not _FOLLOW_UP_REFERENCE_PATTERN.search(query):
+        return query
+    previous_query = _limit_prompt_text(
+        history[-1]["query"],
+        _MAX_HISTORY_MESSAGE_CHARS,
+    )
+    return f"Current question: {query}\nRelated prior question: {previous_query}"
 
 
 def _profile_context(profile_data: dict[str, Any]) -> str:
@@ -224,6 +398,9 @@ async def build_assistant_graph(
             model=settings.llm_model,
             temperature=0,
             api_key=settings.openai_api_key,
+            max_retries=3,
+            request_timeout=30,
+            
         )
 
     if router_model is None:
@@ -290,12 +467,15 @@ async def build_assistant_graph(
             *,
             definition: Any = specialist,
             compiled_agent: Any = agent,
-        ) -> dict[str, str]:
+        ) -> dict[str, Any]:
+            source_attributions = list(state["source_attributions"])
             profile_context = _profile_context(state["user_profile"])
             contextual_query = (
                 f"{profile_context}\n\n" if profile_context else ""
             ) + (
-                "Retrieved knowledge context:\n"
+                "Use only the relevant excerpts below. Cite PDF-supported claims "
+                "with their IDs (for example, [S1]); do not invent IDs or add a "
+                "Sources section. The application adds PDF and API sources.\n"
                 f"{state['retrieved_context']}\n\n"
                 f"User question:\n{state['query']}"
             )
@@ -323,7 +503,17 @@ async def build_assistant_graph(
                     }
                 )
                 answer = _answer_text(response)
-            return {"answer": answer}
+                source_attributions.extend(
+                    _external_api_attributions(response.get("messages", []))
+                )
+            answer = _append_source_attributions(
+                answer,
+                source_attributions,
+            )
+            return {
+                "answer": answer,
+                "source_attributions": source_attributions,
+            }
 
         specialist_nodes[specialist.name.value] = run_specialist
 
@@ -348,15 +538,9 @@ async def build_assistant_graph(
 
     async def retrieve_context(state: AssistantState) -> dict[str, str]:
         specialist = SPECIALISTS[AgentType(state["route"])]
-        recent_context = "\n".join(
-            f"Previous question: {turn['query']}\n"
-            f"Previous answer: {turn['answer']}"
-            for turn in state["conversation_history"][-2:]
-        )
-        retrieval_query = (
-            f"{recent_context}\nCurrent question: {state['query']}"
-            if recent_context
-            else state["query"]
+        retrieval_query = _retrieval_query(
+            state["query"],
+            state["conversation_history"],
         )
         retrieval_arguments = {
             "query": retrieval_query,
@@ -366,13 +550,24 @@ async def build_assistant_graph(
             "limit": 5,
         }
         result = await retrieval_tool.ainvoke(retrieval_arguments)
-        context = _format_tool_result(result)
+        fallback_doc_type = (
+            specialist.doc_types[0]
+            if specialist.doc_types is not None and len(specialist.doc_types) == 1
+            else None
+        )
+        context, source_attributions = _format_retrieval_context(
+            result,
+            fallback_doc_type=fallback_doc_type,
+        )
         logger.info(
             "Retrieved knowledge context for %s (%d characters)",
             specialist.name.value,
             len(context),
         )
-        return {"retrieved_context": context}
+        return {
+            "retrieved_context": context,
+            "source_attributions": source_attributions,
+        }
 
     graph = StateGraph(AssistantState)
 
@@ -423,6 +618,7 @@ async def answer_question(
                 "query": normalized_query,
                 "route": "",
                 "retrieved_context": "",
+                "source_attributions": [],
                 "answer": "",
                 "conversation_history": history,
                 "user_profile": {
@@ -435,6 +631,7 @@ async def answer_question(
                 run_name="finance-assistant",
                 tags=["finance-assistant"],
                 metadata={"workflow": "route-retrieve-answer"},
+                max_concurrency=4,
             ),
         )
     answer = state["answer"]

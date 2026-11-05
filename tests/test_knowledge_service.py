@@ -19,6 +19,10 @@ class KnowledgeServiceTests(unittest.TestCase):
                     payload={
                         "DocType": "QAndA",
                         "combined_text": "A bond is a debt instrument.",
+                        "document_title": "Personal Finance Guide",
+                        "source_file": "finance-guide.pdf",
+                        "page_start": 3,
+                        "page_end": 4,
                         "section_path": "1.2",
                         "dense_text": "embedding-only content",
                         "sparse_text": "keyword-only content",
@@ -62,6 +66,18 @@ class KnowledgeServiceTests(unittest.TestCase):
         self.assertEqual(
             cached_result["results"][0]["text"],
             "A bond is a debt instrument.",
+        )
+        self.assertEqual(
+            cached_result["results"][0]["metadata"]["document_title"],
+            "Personal Finance Guide",
+        )
+        self.assertEqual(
+            cached_result["results"][0]["metadata"]["source_file"],
+            "finance-guide.pdf",
+        )
+        self.assertEqual(
+            cached_result["results"][0]["metadata"]["page_start"],
+            3,
         )
         self.assertEqual(dense_embedding.call_count, 1)
         self.assertEqual(sparse_embedding.call_count, 1)

@@ -80,6 +80,45 @@ class LangSmithEvaluationTests(unittest.TestCase):
         self.assertEqual(present["score"], 1.0)
         self.assertEqual(missing["score"], 0.0)
 
+    def test_source_attribution_evaluator_checks_pdf_and_api_sources(self) -> None:
+        expected_sources = [
+            "[S1] PDF: tax_education.pdf",
+            "External API: Alpha Vantage (stock quote)",
+        ]
+        correct = evaluation.source_attribution_accuracy(
+            {"query": "Explain tax rules and get the latest quote."},
+            {
+                "answer": (
+                    "Explanation and quote.\n\nSources:\n"
+                    "- [S1] PDF: tax_education.pdf\n"
+                    "- External API: Alpha Vantage (stock quote)"
+                ),
+                "source_attributions": expected_sources,
+            },
+            {},
+        )
+        missing = evaluation.source_attribution_accuracy(
+            {"query": "Explain tax rules and get the latest quote."},
+            {
+                "answer": "Explanation and quote.",
+                "source_attributions": expected_sources,
+            },
+            {},
+        )
+        no_sources = evaluation.source_attribution_accuracy(
+            {"query": "Explain a general concept."},
+            {
+                "answer": "General educational answer.",
+                "source_attributions": [],
+            },
+            {},
+        )
+
+        self.assertEqual(correct["score"], 1.0)
+        self.assertIn("PDF, external API", correct["comment"])
+        self.assertEqual(missing["score"], 0.0)
+        self.assertEqual(no_sources["score"], 1.0)
+
     def test_answer_quality_evaluator_uses_reference_rubric(self) -> None:
         class FakeJudgeResult(BaseModel):
             score: int = 4

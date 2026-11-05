@@ -67,6 +67,51 @@ flowchart LR
     EvalSet[Curated evaluation dataset] -. "A/B experiments and evaluators" .-> LangSmith
 ```
 
+### Low-Level Design: Settings loading
+
+`src/core/settings.py` loads application configuration and exposes it as a
+cached, immutable `Settings` object. Non-secret defaults come from
+`config.yaml`; supported environment variables take precedence. The project
+`.env` is loaded at module import and supplies environment values when they
+aren't already set by the process.
+
+```mermaid
+flowchart TD
+    A[Import core.settings] --> B[Resolve project root and config.yaml path]
+    B --> C[Load project .env into process environment]
+    C --> D[Application calls get_settings]
+    D --> E{Cached Settings available?}
+    E -- Yes --> F[Return cached Settings]
+    E -- No --> G[Read and parse config.yaml]
+    G --> H{Root is a YAML mapping?}
+    H -- No --> X[Raise configuration or YAML error]
+    H -- Yes --> I[Read named sections]
+    I --> J[For each setting, prefer environment value over YAML default]
+    J --> K[Parse integer and boolean values]
+    K --> L{Values valid?}
+    L -- No --> Y[Raise ValueError]
+    L -- Yes --> M[Resolve relative data and database paths from project root]
+    M --> N[Create frozen Settings dataclass]
+    N --> O[Cache and return Settings]
+```
+
+Implementation details:
+
+1. `PROJECT_ROOT` is derived from the location of `settings.py`; `CONFIG_FILE`
+   points to `config.yaml` at the project root.
+2. `_read_config()` reads YAML and rejects unreadable files, invalid YAML, or a
+   root value that isn't a mapping. `_section()` similarly validates each
+   configuration section.
+3. `get_settings()` uses helper functions to read strings, integers, and
+   booleans. Invalid integer/boolean environment values raise errors instead of
+   silently falling back to defaults.
+4. Relative `DATA_DIRECTORY` and `CONVERSATION_DB_PATH` values are resolved
+   against `PROJECT_ROOT`. Secret values, such as API keys, are read from the
+   environment or `.env`, not from `config.yaml`.
+5. The returned `Settings` dataclass is frozen, and `@lru_cache(maxsize=1)`
+   keeps one instance for the process. Tests call `get_settings.cache_clear()`
+   when verifying different configurations.
+
 ### Main runtime flow
 
 1. The CLI identifies the request with a `user_id` and `thread_id`. These IDs
@@ -81,10 +126,21 @@ flowchart LR
    guidance.
 4. The workflow retrieves relevant Qdrant chunks using the current question
    and recent conversation context, filtered by the selected specialist's
-   document type.
+   document type. Each excerpt includes a source ID and available document
+   title, explicit PDF filename, page range, and section metadata. If an older
+   Qdrant point lacks `source_file`, the workflow uses its `DocType` to identify
+   the configured PDF used for ingestion. Retrieval prompts use the current
+   question alone unless it is a clear follow-up, when only the latest prior
+   question is added; retrieved context is limited to four excerpts of at most
+   1,800 characters each.
 5. The specialist combines the question, retrieved knowledge, recent turns,
-   and profile context. Its LangChain agent can call only its assigned MCP
-   tools; the MCP server executes those finance or knowledge operations.
+   and profile context, citing knowledge-base claims with the provided source
+   IDs. The response's Sources list labels retrieved documents as PDF sources
+   and identifies any external API used by a successful finance-tool call.
+   The prompt includes at most two recent conversation turns, with each
+   message capped at 1,200 characters. Its LangChain agent can call only its
+   assigned MCP tools; the MCP server executes those finance or knowledge
+   operations.
 6. After a successful response, the workflow stores the question and answer
    under that user and thread in SQLite. Failed requests are not added as
    completed turns.
@@ -98,6 +154,55 @@ IDs are supplied after restarting. Choosing another conversation ID starts a
 separate thread, while the user's profile remains shared across their threads.
 The graph selects one specialist per question; it does not fan out to multiple
 specialists or serve a web UI.
+
+### LangGraph workflow
+
+`answer_question` loads the user's profile and recent conversation turns from
+SQLite before invoking the compiled graph. The graph routes the question,
+retrieves context for the selected specialist, and then runs only that
+specialist. On success, the answer and question are saved to the same
+conversation.
+
+```mermaid
+flowchart TD
+    START([START]) --> ROUTER[route_query<br/>Intent router]
+    ROUTER --> RETRIEVE[retrieve_context<br/>MCP search_knowledge]
+    RETRIEVE --> ROUTE{Selected specialist}
+
+    ROUTE -->|finance_qa| FINANCE[Finance Q&amp;A]
+    ROUTE -->|portfolio_analysis| PORTFOLIO[Portfolio Analysis]
+    ROUTE -->|market_analysis| MARKET[Market Analysis]
+    ROUTE -->|goal_planning| GOALS[Goal Planning]
+    ROUTE -->|news_synthesizer| NEWS[News Synthesizer]
+    ROUTE -->|tax_education| TAX[Tax Education]
+
+    FINANCE --> END([END])
+    PORTFOLIO --> END
+    MARKET --> END
+    GOALS --> END
+    NEWS --> END
+    TAX --> END
+
+    HISTORY[(SQLite conversation store)] -. load history and profile .-> ROUTER
+    FINANCE -. generated answer .-> HISTORY
+    PORTFOLIO -. generated answer .-> HISTORY
+    MARKET -. generated answer .-> HISTORY
+    GOALS -. generated answer .-> HISTORY
+    NEWS -. generated answer .-> HISTORY
+    TAX -. generated answer .-> HISTORY
+    RETRIEVE -. search_knowledge .-> MCP[MCP server<br/>knowledge and finance tools]
+    MCP -. filtered hybrid search .-> QDRANT[(Qdrant knowledge base)]
+
+    PORTFOLIO -. optional assigned tools .-> MCP
+    MARKET -. optional assigned tools .-> MCP
+    GOALS -. optional assigned tools .-> MCP
+    NEWS -. optional assigned tools .-> MCP
+```
+
+The dashed edges show supporting operations rather than extra LangGraph nodes:
+conversation/profile reads happen before graph invocation, the final answer is
+persisted after successful completion, retrieval calls Qdrant through MCP, and
+only specialists with assigned finance tools can call those tools.
 
 Conversation history and profile data are stored locally in the configured
 SQLite database, independently from LangSmith traces. When tracing is enabled,
@@ -136,11 +241,12 @@ unless the project's privacy, consent, and retention policies permit it.
 The evaluation harness creates or reuses the versioned
 `finance-assistant-routing-v1` LangSmith dataset from
 `src/evaluation/datasets/finance_router_v1.json`. It has twelve synthetic
-queries covering all six specialists. Three evaluators record exact route
-accuracy, non-empty answers, and rubric-based answer quality from the configured
-OpenAI model. Experiment A uses the Jev Decisions API router; experiment B uses
-an OpenAI structured-output router. Both use the same specialist answer model,
-retrieval, MCP tools, dataset, and evaluators.
+queries covering all six specialists. Four evaluators record exact route
+accuracy, non-empty answers, source-attribution completeness (including both
+PDF and external API sources when present), and rubric-based answer quality
+from the configured OpenAI model. Experiment A uses the Jev Decisions API
+router; experiment B uses an OpenAI structured-output router. Both use the same
+specialist answer model, retrieval, MCP tools, dataset, and evaluators.
 
 The initial 12-example run on 2026-10-29 completed both experiments. Both
 variants achieved 100% route accuracy and 100% non-empty answers. The normalized
@@ -173,6 +279,9 @@ synthetic evaluation queries; LangSmith traces can retain prompts, retrieved
 content, tool inputs/outputs, and model answers. This baseline comparison
 measures routing impact while keeping answer generation and supporting services
 constant; market/news examples can still depend on external data availability.
+Each run creates new experiment results; existing LangSmith experiments are not
+re-evaluated when evaluator code changes. Run the command again to see the
+`source_attribution` metric on new experiment rows.
 
 ### Deployment boundaries
 
@@ -392,6 +501,42 @@ running while clients connect. In VS Code, start the **Python: Debug MCP
 server** launch configuration, then connect to the `finance-assistant` server
 in `.vscode/mcp.json`.
 
+### Run a local concurrent load test
+
+Install the development dependency once:
+
+```sh
+.venv/bin/python -m pip install -r requirements-dev.txt
+```
+
+Start the MCP server in one terminal. In another, run Locust against the actual
+assistant workflow:
+
+```sh
+PYTHONPATH=src LANGSMITH_TRACING=false \
+MCP_SERVER_URL=http://127.0.0.1:8000/mcp \
+CONVERSATION_DB_PATH=data/locust_load_test.sqlite3 \
+.venv/bin/locust -f load_test/locustfile.py --headless \
+  --html load_test/report.html --csv load_test/results \
+  --users 20 --spawn-rate 5 --run-time 1m
+```
+
+Each virtual user asks the workflow a question using a unique user ID and
+conversation thread. Locust reports end-to-end `answer_question` latency and
+failures, including routing, knowledge retrieval, and answer generation. The
+test requires `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, a running MCP server, and
+working Qdrant configuration. The default question is an educational prompt;
+set `LOCUST_WORKFLOW_QUESTION` to test another workflow path. Finance-data
+questions may also call Alpha Vantage.
+
+The compiled graph is shared by concurrent requests on a dedicated asyncio
+loop. Conversation history is stored in the separate local database configured
+above. Tracing is disabled for this run to avoid sending test prompts to
+LangSmith. Adjust `--users`, `--spawn-rate`, and `--run-time` for the desired
+load.
+
+The Locust scenario and its output files are kept together in `load_test/`.
+
 ## Run the LangGraph assistant
 
 Start the MCP server first, then in another terminal run:
@@ -399,6 +544,10 @@ Start the MCP server first, then in another terminal run:
 ```sh
 PYTHONPATH=src .venv/bin/python -m workflow.assistant
 ```
+
+In VS Code, select **Python: Debug assistant** in the Run and Debug panel to
+launch this same module with breakpoints. Start the MCP server separately
+before debugging the assistant.
 
 The CLI asks for a user ID and conversation ID; accept the defaults to resume
 the default local conversation, or use distinct IDs for separate users and

@@ -12,6 +12,7 @@ import pandas as pd
 from qdrant_client import QdrantClient, models
 
 from core.settings import get_settings
+from core.knowledge_sources import KNOWLEDGE_SOURCE_FILES
 from rag.embedding import make_dense_embedding, make_sparse_embedding
 from rag.pdf_ingestion import read_news_synthesizer_chunks, read_pdf_chunks
 
@@ -19,9 +20,17 @@ from rag.pdf_ingestion import read_news_synthesizer_chunks, read_pdf_chunks
 logger = logging.getLogger(__name__)
 _VECTOR_COLUMNS = {"dense_embedding", "sparse_embedding", "dense_text", "sparse_text"}
 _DATASETS = (
-    ("QAndA", "financeQnA.pdf", read_pdf_chunks),
-    ("NewsSynthesiser", "News_Systhesizer.pdf", read_news_synthesizer_chunks),
-    ("TaxEducation", "tax_education.pdf", read_news_synthesizer_chunks),
+    ("QAndA", KNOWLEDGE_SOURCE_FILES["QAndA"], read_pdf_chunks),
+    (
+        "NewsSynthesiser",
+        KNOWLEDGE_SOURCE_FILES["NewsSynthesiser"],
+        read_news_synthesizer_chunks,
+    ),
+    (
+        "TaxEducation",
+        KNOWLEDGE_SOURCE_FILES["TaxEducation"],
+        read_news_synthesizer_chunks,
+    ),
 )
 
 

@@ -131,6 +131,51 @@ def answer_present(
     }
 
 
+def source_attribution_accuracy(
+    inputs: dict[str, Any],
+    outputs: dict[str, Any],
+    reference_outputs: dict[str, Any],
+) -> dict[str, Any]:
+    """Check that every system-attributed PDF/API source appears once in the answer."""
+    answer = outputs.get("answer")
+    sources = outputs.get("source_attributions")
+    if not isinstance(answer, str) or not isinstance(sources, list):
+        return {
+            "key": "source_attribution",
+            "score": 0.0,
+            "comment": "The answer or source attribution output is missing.",
+        }
+
+    source_headers = answer.count("Sources:")
+    missing_sources = [
+        source
+        for source in sources
+        if not isinstance(source, str) or f"- {source}" not in answer
+    ]
+    expected_headers = 1 if sources else 0
+    passed = source_headers == expected_headers and not missing_sources
+    source_types = {
+        "PDF"
+        for source in sources
+        if isinstance(source, str) and "PDF:" in source
+    }
+    source_types.update(
+        "external API"
+        for source in sources
+        if isinstance(source, str) and "External API:" in source
+    )
+    return {
+        "key": "source_attribution",
+        "score": float(passed),
+        "comment": (
+            f"query={inputs.get('query', '')}; source_types="
+            f"{', '.join(sorted(source_types)) or 'none'}; "
+            f"missing_sources={len(missing_sources)}; "
+            f"source_headers={source_headers}; expected_headers={expected_headers}"
+        ),
+    }
+
+
 def make_answer_quality_evaluator(judge: Any) -> Any:
     """Build an LLM-as-judge evaluator that scores the answer against the rubric."""
 
@@ -231,11 +276,12 @@ async def run_experiments() -> tuple[Any, Any]:
     evaluators = [
         route_accuracy,
         answer_present,
+        source_attribution_accuracy,
         make_answer_quality_evaluator(judge),
     ]
 
     async def evaluate_variant(name: str, graph: Any) -> Any:
-        async def target(inputs: dict[str, Any]) -> dict[str, str]:
+        async def target(inputs: dict[str, Any]) -> dict[str, Any]:
             with tracing_context(
                 enabled=True,
                 client=client,
@@ -252,7 +298,11 @@ async def run_experiments() -> tuple[Any, Any]:
                         "user_profile": {},
                     }
                 )
-            return {"route": state["route"], "answer": state["answer"]}
+            return {
+                "route": state["route"],
+                "answer": state["answer"],
+                "source_attributions": state["source_attributions"],
+            }
 
         return await aevaluate(
             target,
@@ -262,12 +312,14 @@ async def run_experiments() -> tuple[Any, Any]:
             description=(
                 "Finance assistant routing A/B evaluation. Both variants use "
                 f"the same specialist model ({settings.llm_model}), retrieval, "
-                "tools, dataset, and answer-quality evaluator."
+                "tools, dataset, answer-quality evaluator, and source-attribution "
+                "evaluator."
             ),
             metadata={
                 "router_variant": name,
                 "answer_model": settings.llm_model,
                 "dataset_version": 1,
+                "evaluation_version": 2,
             },
             max_concurrency=1,
             client=client,
