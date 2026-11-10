@@ -12,9 +12,10 @@ src/
 ├── core/         # Settings, errors, and SQLite conversation/profile storage
 ├── data/         # Finance API, Qdrant adapters, and source PDFs
 ├── mcp_server/   # MCP transport and tool registration
+├── api/          # FastAPI endpoints for the conversational and dashboard UI
 ├── rag/          # PDF parsing and dense/sparse embedding models
 ├── utils/        # Shared logging configuration
-├── web_app/      # Future user interface (not implemented yet)
+├── web_app/      # Reserved for a future user interface
 └── workflow/     # Ingestion and LangGraph assistant workflow
 tests/            # Unit tests
 config.yaml       # Non-secret application defaults
@@ -38,7 +39,51 @@ the `text-dense` and
 The application answers finance questions by routing each request to a
 specialist, retrieving relevant PDF knowledge, and optionally calling external
 finance tools through MCP. The current user-facing entry point is a command-line
-workflow; a web application package is reserved for future UI work.
+workflow; the FastAPI service in `src/api/` also exposes the workflow and finance
+data services to a separate UI.
+
+## FastAPI UI service
+
+Install the requirements and start the API from the repository root:
+
+```sh
+pip install -r requirements.txt
+PYTHONPATH=src uvicorn api.main:app --reload
+```
+
+Interactive API documentation is available at `http://127.0.0.1:8000/docs`.
+The conversational endpoints use the existing LangGraph workflow and SQLite
+conversation store:
+
+- `POST /chat` accepts `message`, with optional `user_id` and `thread_id`.
+- `GET /chat/history` returns saved turns for a user and conversation.
+- `DELETE /chat/history` clears the selected conversation's saved turns.
+
+Conversation IDs scope local storage but are not authentication credentials. Do
+not expose the API publicly without adding an authentication layer or protecting
+it behind a trusted gateway.
+
+Dashboard endpoints provide:
+
+- `POST /portfolio/analysis` with `holdings` containing ticker `symbol`,
+  `quantity`, and optional `average_cost`; the response includes position values,
+  allocation percentages, and available gain/loss totals for visualizations.
+- `GET /market/quote/{symbol}` for the latest available quote.
+- `GET /market/overview/{symbol}` for company fundamentals.
+- `GET /market/history/{symbol}?outputsize=compact` for chart-ready daily OHLCV
+  points ordered oldest to newest (`full` requests the full available series).
+
+Market endpoints require `ALPHA_VANTAGE_API_KEY`. Chat requires the same model,
+MCP, and knowledge services as the existing workflow. Browser origins are
+restricted to common local development ports by default; set
+`FINANCE_ASSISTANT_CORS_ORIGINS` to a comma-separated allowlist for a deployed UI.
+
+For local API debugging, set `API_DEBUG=true` in `.env` (or `api.debug: true` in
+`config.yaml`) and restart the API. This enables FastAPI debug tracebacks and
+logs each request's method, path, status, and duration. Keep debug mode disabled
+in production because tracebacks can disclose internal details. In VS Code,
+select **Python: Debug API (with MCP)** in Run and Debug to start both services
+with breakpoints enabled; the API listens on port `8080` and MCP on port `8000`.
 
 ### System context
 

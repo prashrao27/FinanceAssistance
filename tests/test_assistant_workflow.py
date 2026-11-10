@@ -48,7 +48,7 @@ class FakeModel:
         self.invocations.append(messages)
         return AIMessage(
             content=(
-                "Grounded finance education answer.\n\n"
+                "Grounded finance education answer [S1].\n\n"
                 "Sources:\n- [S1] model-generated source"
             )
         )
@@ -145,7 +145,7 @@ class AssistantWorkflowTests(unittest.TestCase):
 
         self.assertEqual(result["route"], AgentType.TAX_EDUCATION.value)
         self.assertTrue(
-            result["answer"].startswith("Grounded finance education answer.")
+            result["answer"].startswith("Grounded finance education answer")
         )
         self.assertIn(
             "Sources:\n- [S1] Personal Finance Guide, PDF: finance-guide.pdf, "
@@ -177,6 +177,41 @@ class AssistantWorkflowTests(unittest.TestCase):
         self.assertEqual(self.retrieval_calls[0]["limit"], 5)
         create_agent.assert_called()
 
+    def test_refusal_does_not_list_unreferenced_retrieval_sources(self) -> None:
+        refusal = (
+            "I'm sorry, but I cannot assist with that. "
+            "If you have questions about financial concepts, feel free to ask!"
+        )
+
+        async def run() -> dict[str, Any]:
+            model = FakeModel(AgentType.FINANCE_QA)
+            graph = await assistant.build_assistant_graph(
+                model=model,
+                router_model=FakeModel(AgentType.PORTFOLIO_ANALYSIS),
+                mcp_tools=self.tools,
+            )
+            return await graph.ainvoke(
+                {
+                    "query": "An unrelated question",
+                    "route": "",
+                    "retrieved_context": "",
+                    "source_attributions": [],
+                    "answer": "",
+                    "conversation_history": [],
+                    "user_profile": {},
+                }
+            )
+
+        with patch.object(
+            assistant,
+            "create_agent",
+            return_value=FakeAgent([AIMessage(content=refusal)]),
+        ):
+            result = asyncio.run(run())
+
+        self.assertEqual(result["answer"], refusal)
+        self.assertEqual(result["source_attributions"], [])
+
     def test_response_lists_pdf_and_external_api_sources(self) -> None:
         async def run() -> dict[str, Any]:
             model = FakeModel(AgentType.MARKET_ANALYSIS)
@@ -207,7 +242,7 @@ class AssistantWorkflowTests(unittest.TestCase):
                         tool_call_id="quote-1",
                         name="get_stock_quote",
                     ),
-                    AIMessage(content="NVDA's latest quote is $100."),
+                    AIMessage(content="NVDA's latest quote is $100 [S1]."),
                 ]
             ),
         ):

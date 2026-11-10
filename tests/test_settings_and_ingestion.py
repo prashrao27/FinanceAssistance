@@ -27,6 +27,30 @@ class SettingsAndIngestionTests(unittest.TestCase):
         finally:
             get_settings.cache_clear()
 
+    def test_api_debug_supports_config_and_environment_override(self) -> None:
+        get_settings.cache_clear()
+        try:
+            with (
+                patch(
+                    "core.settings._read_config",
+                    return_value={"api": {"debug": True}},
+                ),
+                patch.dict(os.environ, {}, clear=True),
+            ):
+                self.assertTrue(get_settings().api_debug)
+
+            get_settings.cache_clear()
+            with (
+                patch(
+                    "core.settings._read_config",
+                    return_value={"api": {"debug": True}},
+                ),
+                patch.dict(os.environ, {"API_DEBUG": "false"}),
+            ):
+                self.assertFalse(get_settings().api_debug)
+        finally:
+            get_settings.cache_clear()
+
     def test_environment_overrides_yaml_defaults(self) -> None:
         get_settings.cache_clear()
         try:

@@ -193,15 +193,36 @@ def _format_retrieval_context(
     return "\n\n".join(chunks), source_attributions
 
 
-def _append_source_attributions(answer: str, source_attributions: list[str]) -> str:
-    if not source_attributions:
-        return answer
-
-    answer_body = re.split(
+def _answer_body(answer: str) -> str:
+    return re.split(
         r"(?im)^\s*(?:#{1,6}\s*)?(?:\*\*)?sources(?:\*\*)?\s*:\s*$",
         answer,
         maxsplit=1,
     )[0].rstrip()
+
+
+def _source_attributions_used(
+    answer: str,
+    source_attributions: list[str],
+) -> list[str]:
+    cited_ids = set(re.findall(r"\[(S\d+)\]", _answer_body(answer)))
+    used_attributions = []
+    for attribution in source_attributions:
+        match = re.match(r"\[(S\d+)\](?:\s|$)", attribution)
+        if match is None or match.group(1) in cited_ids:
+            used_attributions.append(attribution)
+    return used_attributions
+
+
+def _append_source_attributions(answer: str, source_attributions: list[str]) -> str:
+    answer_body = _answer_body(answer)
+    source_attributions = _source_attributions_used(
+        answer_body,
+        source_attributions,
+    )
+    if not source_attributions:
+        return answer_body
+
     sources = "\n".join(f"- {source}" for source in source_attributions)
     if not answer_body:
         return f"Sources:\n{sources}"
@@ -473,9 +494,10 @@ async def build_assistant_graph(
             contextual_query = (
                 f"{profile_context}\n\n" if profile_context else ""
             ) + (
-                "Use only the relevant excerpts below. Cite PDF-supported claims "
-                "with their IDs (for example, [S1]); do not invent IDs or add a "
-                "Sources section. The application adds PDF and API sources.\n"
+                "Use only excerpts that directly support your response. Cite "
+                "PDF-supported claims with their IDs (for example, [S1]); cite "
+                "only excerpts you actually used. Do not invent IDs or add a "
+                "Sources section.\n"
                 f"{state['retrieved_context']}\n\n"
                 f"User question:\n{state['query']}"
             )
@@ -506,6 +528,10 @@ async def build_assistant_graph(
                 source_attributions.extend(
                     _external_api_attributions(response.get("messages", []))
                 )
+            source_attributions = _source_attributions_used(
+                answer,
+                source_attributions,
+            )
             answer = _append_source_attributions(
                 answer,
                 source_attributions,

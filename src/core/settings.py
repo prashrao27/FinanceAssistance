@@ -26,6 +26,7 @@ class Settings:
     openrouter_base_url: str
     mcp_server_url: str
     log_level: str
+    api_debug: bool
     data_directory: Path
     conversation_db_path: Path
     conversation_history_turns: int
@@ -80,6 +81,7 @@ def get_settings() -> Settings:
     router = _section(config, "router")
     mcp = _section(config, "mcp")
     logging_config = _section(config, "logging")
+    api = _section(config, "api")
     langsmith = _section(config, "langsmith")
     storage = _section(config, "storage")
     data = _section(config, "data")
@@ -151,6 +153,7 @@ def get_settings() -> Settings:
             )
         ),
         log_level=str(env_string("LOG_LEVEL", logging_config.get("level", "INFO"))),
+        api_debug=env_boolean("API_DEBUG", api.get("debug", False)),
         data_directory=data_directory,
         conversation_db_path=conversation_db_path,
         conversation_history_turns=env_integer(

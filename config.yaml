@@ -14,6 +14,9 @@ mcp:
 logging:
   level: INFO
 
+api:
+  debug: false
+
 langsmith:
   tracing: true
   project: FinanceAssistance
