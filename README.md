@@ -15,7 +15,7 @@ src/
 ├── api/          # FastAPI endpoints for the conversational and dashboard UI
 ├── rag/          # PDF parsing and dense/sparse embedding models
 ├── utils/        # Shared logging configuration
-├── web_app/      # Reserved for a future user interface
+├── web_app/      # Streamlit frontend that calls the FastAPI service
 └── workflow/     # Ingestion and LangGraph assistant workflow
 tests/            # Unit tests
 config.yaml       # Non-secret application defaults
@@ -38,63 +38,156 @@ the `text-dense` and
 
 The application answers finance questions by routing each request to a
 specialist, retrieving relevant PDF knowledge, and optionally calling external
-finance tools through MCP. The current user-facing entry point is a command-line
-workflow; the FastAPI service in `src/api/` also exposes the workflow and finance
-data services to a separate UI.
+finance tools through MCP. It provides a command-line assistant and a Streamlit
+web UI. The UI calls the FastAPI service in `src/api/` for chat, portfolio
+analysis, and market data.
 
-## FastAPI UI service
+## Run the API and Streamlit UI
 
-Install the requirements and start the API from the repository root:
+From the repository root, create the virtual environment and install the
+project dependencies:
 
-```sh
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-PYTHONPATH=src uvicorn api.main:app --reload
+cp .env.example .env
 ```
 
-Interactive API documentation is available at `http://127.0.0.1:8000/docs`.
-The conversational endpoints use the existing LangGraph workflow and SQLite
-conversation store:
+The Streamlit app is the browser UI and communicates with the backend through
+FastAPI; it does not access the workflow or finance services directly. Start
+MCP, FastAPI, and Streamlit in separate terminals:
 
-- `POST /chat` accepts `message`, with optional `user_id` and `thread_id`.
-- `GET /chat/history` returns saved turns for a user and conversation.
-- `DELETE /chat/history` clears the selected conversation's saved turns.
+```bash
+# Terminal 1: MCP tools
+PYTHONPATH=src .venv/bin/python -m mcp_server.server
 
-Conversation IDs scope local storage but are not authentication credentials. Do
-not expose the API publicly without adding an authentication layer or protecting
-it behind a trusted gateway.
+# Terminal 2: FastAPI backend
+PYTHONPATH=src .venv/bin/uvicorn api.main:app --reload --host 127.0.0.1 --port 8080
 
-Dashboard endpoints provide:
+# Terminal 3: Streamlit frontend
+PYTHONPATH=src .venv/bin/streamlit run src/web_app/app.py
+```
 
-- `POST /portfolio/analysis` with `holdings` containing ticker `symbol`,
-  `quantity`, and optional `average_cost`; the response includes position values,
-  allocation percentages, and available gain/loss totals for visualizations.
-- `GET /market/quote/{symbol}` for the latest available quote.
-- `GET /market/overview/{symbol}` for company fundamentals.
-- `GET /market/history/{symbol}?outputsize=compact` for chart-ready daily OHLCV
-  points ordered oldest to newest (`full` requests the full available series).
+Open `http://localhost:8501` for the UI. Its sidebar uses
+`http://127.0.0.1:8080` as the FastAPI base URL by default; change it there if
+the API is running elsewhere and use **Check API connection** to verify it.
+The UI includes:
 
-Market endpoints require `ALPHA_VANTAGE_API_KEY`. Chat requires the same model,
-MCP, and knowledge services as the existing workflow. Browser origins are
-restricted to common local development ports by default; set
-`FINANCE_ASSISTANT_CORS_ORIGINS` to a comma-separated allowlist for a deployed UI.
+- **Chat**: sends questions to `POST /chat`, loads persisted conversation turns,
+  and can clear the selected conversation.
+- **Portfolio**: submits ticker, share quantity, and optional average cost to
+  `POST /portfolio/analysis`; displays position values and allocation charts.
+- **Market**: loads quote, company overview, and chart-ready daily price data
+  from the `/market` endpoints.
 
-For local API debugging, set `API_DEBUG=true` in `.env` (or `api.debug: true` in
+Choose a distinct conversation ID to start a separate chat thread. User and
+conversation IDs only scope stored data; they are not authentication. The API
+health check is `http://127.0.0.1:8080/health`; interactive API documentation
+is at `http://127.0.0.1:8080/docs`.
+
+Set credentials in `.env` for the services you use. Chat requires
+`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, and working Qdrant and MCP services.
+Market-data routes require `ALPHA_VANTAGE_API_KEY`.
+
+MCP uses port `8000`; the API uses `8080` to avoid conflict. Postman-friendly
+OpenAPI docs are at `http://127.0.0.1:8080/openapi.json`.
+
+### API endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/health` | Check that the API is running. |
+| `POST` | `/chat` | Send a message through the assistant workflow. |
+| `GET` | `/chat/history` | Read saved turns for a user and conversation. |
+| `DELETE` | `/chat/history` | Delete saved turns for a user and conversation. |
+| `POST` | `/portfolio/analysis` | Analyze positions using current market quotes. |
+| `GET` | `/market/quote/{symbol}` | Get the latest available quote. |
+| `GET` | `/market/overview/{symbol}` | Get company fundamentals. |
+| `GET` | `/market/history/{symbol}` | Get daily OHLCV history for charting. |
+
+Example chat request:
+
+```bash
+curl --request POST 'http://127.0.0.1:8080/chat' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "message": "Explain portfolio diversification.",
+    "user_id": "local-user",
+    "thread_id": "default"
+  }'
+```
+
+Chat `user_id` and `thread_id` default to `local-user` and `default`.
+Conversation history is persisted locally and recent turns are included as
+context in later requests in that thread. Use a different `thread_id` for a new
+conversation. These IDs are for local data scoping, not authentication.
+
+History endpoints accept `user_id` and `thread_id` query parameters, plus an
+optional `limit` from 1 to 500 on `GET /chat/history`:
+
+```bash
+curl 'http://127.0.0.1:8080/chat/history?user_id=local-user&thread_id=default&limit=20'
+curl --request DELETE 'http://127.0.0.1:8080/chat/history?user_id=local-user&thread_id=default'
+```
+
+Portfolio analysis accepts 1–50 holdings. Each holding needs a bare ticker
+symbol and a positive share quantity; `average_cost` is optional:
+
+```bash
+curl --request POST 'http://127.0.0.1:8080/portfolio/analysis' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "holdings": [
+      {"symbol": "AAPL", "quantity": 10, "average_cost": 150},
+      {"symbol": "MSFT", "quantity": 5}
+    ]
+  }'
+```
+
+The response includes each position's current price, market value, and
+allocation percentage, plus portfolio totals and any available gain/loss data.
+It is an informational summary, not investment advice.
+
+Market-data examples:
+
+```bash
+curl 'http://127.0.0.1:8080/market/quote/AAPL'
+curl 'http://127.0.0.1:8080/market/overview/AAPL'
+curl 'http://127.0.0.1:8080/market/history/AAPL?outputsize=compact'
+```
+
+The history `outputsize` can be `compact` or `full`. The API returns normalized
+daily price points (`date`, `open`, `high`, `low`, `close`, and `volume`) ordered
+oldest to newest for charting.
+
+For debugging, set `API_DEBUG=true` in `.env` (or `api.debug: true` in
 `config.yaml`) and restart the API. This enables FastAPI debug tracebacks and
-logs each request's method, path, status, and duration. Keep debug mode disabled
-in production because tracebacks can disclose internal details. In VS Code,
-select **Python: Debug API (with MCP)** in Run and Debug to start both services
-with breakpoints enabled; the API listens on port `8080` and MCP on port `8000`.
+request method, path, status, and duration logging. In VS Code, choose **Python:
+Debug API** to debug API calls, or **Python: Debug API (with MCP)** to start both
+services. Both launch profiles enable API debug mode; API listens on `8080`,
+MCP on `8000`. Keep debug mode disabled in production because tracebacks can
+disclose internal details.
+
+Browser origins are restricted to common local development ports by default.
+Set `FINANCE_ASSISTANT_CORS_ORIGINS` to a comma-separated allowlist for a
+deployed UI. Do not expose the API publicly without authentication or a trusted
+gateway.
 
 ### System context
 
 ```mermaid
 flowchart LR
-    User[User] --> Workflow[LangGraph assistant workflow]
+    User[User] --> Streamlit[Streamlit web UI]
+    Streamlit -->|HTTP API calls| API[FastAPI service]
+    API --> Workflow[LangGraph assistant workflow]
+    API --> ConversationStore[SQLite conversation and profile store]
+    API --> FinanceAPI[Market and portfolio endpoints]
+    User --> CLI[Interactive CLI]
+    CLI --> Workflow
     Workflow -->|user_id, thread_id| ConversationStore[SQLite conversation and profile store]
     ConversationStore -->|recent turns| Workflow
     ConversationStore -->|explicit learning profile| Workflow
-    User -->|profile edits and history commands| CLI[Interactive CLI]
-    CLI --> ConversationStore
     Workflow --> Router[OpenRouter JEV intent model]
     Router --> Specialist[Selected finance specialist]
     Workflow --> MCP[MCP Streamable HTTP server]
@@ -102,7 +195,8 @@ flowchart LR
     MCP --> Knowledge[Hybrid Qdrant knowledge service]
     Knowledge --> Qdrant[(Qdrant collection)]
     Knowledge --> Embedding[FastEmbed dense and sparse models]
-    MCP --> FinanceAPI[Alpha Vantage API]
+    MCP --> AlphaVantage[Alpha Vantage API]
+    FinanceAPI --> AlphaVantage
     Workflow --> LLM[OpenAI chat model]
     Specialist --> LLM
     Ingestion[PDF ingestion workflow] --> PDFs[Finance Q&A, news, tax PDFs]
@@ -180,8 +274,10 @@ Implementation details:
    1,800 characters each.
 5. The specialist combines the question, retrieved knowledge, recent turns,
    and profile context, citing knowledge-base claims with the provided source
-   IDs. The response's Sources list labels retrieved documents as PDF sources
-   and identifies any external API used by a successful finance-tool call.
+   IDs. The response's Sources list includes only retrieved PDF excerpts cited
+   by the answer, and identifies any external API used by a successful
+   finance-tool call. Retrieval results that the answer does not cite are not
+   presented as answer sources.
    The prompt includes at most two recent conversation turns, with each
    message capped at 1,200 characters. Its LangChain agent can call only its
    assigned MCP tools; the MCP server executes those finance or knowledge
@@ -189,16 +285,17 @@ Implementation details:
 6. After a successful response, the workflow stores the question and answer
    under that user and thread in SQLite. Failed requests are not added as
    completed turns.
-7. The user can explicitly view, update, or delete their profile and view or
-   clear a conversation using CLI commands. Profile data is limited to
-   learning level, explanation preferences, and financial goals; holdings
-   and account details are not automatically retained.
+7. The user can view conversation history and clear a conversation from either
+   the API/Streamlit UI or CLI, and can manage their profile using CLI commands.
+   Profile data is limited to learning level, explanation preferences, and
+   financial goals; holdings and account details are not automatically retained.
 
 The local interactive CLI resumes history when the same user and conversation
 IDs are supplied after restarting. Choosing another conversation ID starts a
 separate thread, while the user's profile remains shared across their threads.
-The graph selects one specialist per question; it does not fan out to multiple
-specialists or serve a web UI.
+The graph selects one specialist per question and does not fan out to multiple
+specialists. The Streamlit UI is a separate frontend that communicates with the
+assistant and finance endpoints through FastAPI.
 
 ### LangGraph workflow
 
@@ -351,6 +448,8 @@ re-evaluated when evaluator code changes. Run the command again to see the
 | `core/settings.py` | Loads `config.yaml`, `.env`, and environment overrides into cached typed settings. |
 | `core/conversation_store.py` | Persists conversation turns and explicitly maintained learning profiles in SQLite. |
 | `core/errors.py` | Defines the shared application exception base. |
+| `api/main.py` | Exposes health, chat/history, portfolio analysis, and market-data FastAPI endpoints; lazily builds and shares the assistant graph. |
+| `web_app/app.py` | Provides the Streamlit chat, portfolio, and market UI by calling the FastAPI endpoints. |
 | `agents/router.py` | Defines the structured route decision and routing instructions. |
 | `agents/specialists.py` | Defines the six specialist identities, prompts, knowledge filters, and allowed MCP tool names. |
 | `workflow/assistant.py` | Loads recent history and user profile, routes intent with the configured OpenRouter model, runs retrieval and specialist execution with the answer model, persists successful turns, and exposes the interactive CLI. |
@@ -426,7 +525,13 @@ fields, so consider disabling tracing for sensitive conversations.
 
 The tool list is loaded dynamically from MCP when the graph is built. Startup
 fails with an explicit error if the required retrieval tool or a specialist's
-declared tool is unavailable.
+declared tool is unavailable. The MCP server registers functions decorated with
+`@mcp.tool()` in `src/mcp_server/server.py`. The workflow discovers those tools
+from the configured MCP server and maps them by name; each specialist's
+`mcp_tools` frozenset in `src/agents/specialists.py` declares the additional
+tools that specialist is permitted to use. The retrieval tool
+`search_knowledge` is shared by the workflow and is required when the graph is
+built.
 
 ### Hybrid retrieval and RRF
 
@@ -492,6 +597,9 @@ stored in `config.yaml` or committed. Important settings include:
   `SEARCH_CACHE_MAX_ENTRIES`, `SEARCH_MAX_RESULTS`.
 - Conversation persistence: `CONVERSATION_DB_PATH`,
   `CONVERSATION_HISTORY_TURNS`.
+- API debugging: `API_DEBUG` or `api.debug` in `config.yaml`; disabled by
+  default. Debug tracebacks can disclose internal details, so leave it disabled
+  in production.
 
 ### Reliability, security, and limitations
 
